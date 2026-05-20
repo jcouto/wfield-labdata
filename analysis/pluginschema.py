@@ -68,6 +68,7 @@ class WfieldStack(dj.Computed):
                                                    out=out,
                                                    mode = par['motion_correction'],
                                                    chunksize = par['chunk_size'],
+                                                   diff_gaussians_filter=par['motion_conv_kernel'],
                                                    apply_shifts = True)
         from tqdm.auto import tqdm
         chunkidx = chunk_indices(len(out),chunksize=par['chunk_size'])
