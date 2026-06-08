@@ -2,9 +2,11 @@ import numpy as np
 
 __all__ = [
     'build_alignment_transform',
+    'build_atlas_transform',
     'warp_image',
     'transform_coordinates',
     'inverse_transform_coordinates',
+    'transform_atlas_regions',
 ]
 
 
@@ -109,5 +111,69 @@ def inverse_transform_coordinates(xy, M_fwd):
         Corresponding ``(col, row)`` points in 2P space.
     """
     return transform_coordinates(xy, np.linalg.inv(M_fwd))
+
+
+def build_atlas_transform(bregma_xy, resolution, rotation=0.0, scale=1.0, ratio=1.0):
+    """Build a 3×3 forward matrix mapping atlas mm coordinates to widefield pixel coordinates.
+
+    Atlas regions are expressed in mm relative to bregma (bregma = origin).
+    The resulting matrix places bregma at ``bregma_xy`` in the widefield image.
+
+    Parameters
+    ----------
+    bregma_xy : (col, row)
+        Location of bregma in the widefield image, in pixels.
+    resolution : float
+        mm per pixel — base scale converting atlas mm to pixel distances.
+    rotation : float
+        Rotation in degrees (counter-clockwise).
+    scale : float
+        Additional isotropic scale applied on top of ``1/resolution``.
+    ratio : float
+        X/Y aspect ratio correction; effective sx = (scale * ratio) / resolution.
+
+    Returns
+    -------
+    M_fwd : ndarray, shape (3, 3)
+    """
+    bregma_col, bregma_row = float(bregma_xy[0]), float(bregma_xy[1])
+    theta = np.deg2rad(float(rotation))
+    cs, sn = np.cos(theta), np.sin(theta)
+    sx = float(scale) * float(ratio) / float(resolution)
+    sy = float(scale) / float(resolution)
+    return np.array([[sx * cs, -sy * sn, bregma_col],
+                     [sx * sn,  sy * cs, bregma_row],
+                     [0,        0,       1          ]], dtype=float)
+
+
+def transform_atlas_regions(ccf_regions, M_fwd):
+    """Transform atlas contour DataFrame from mm space to image pixel space.
+
+    Parameters
+    ----------
+    ccf_regions : DataFrame
+        From ``allen_load_reference()``; columns ``*_x`` / ``*_y`` hold mm coordinates
+        relative to bregma, and ``*_center`` holds ``[x_mm, y_mm]`` centroids.
+    M_fwd : ndarray, shape (3, 3)
+        Forward transform mapping atlas mm coordinates to widefield pixel coordinates.
+        Build with ``build_atlas_transform()`` (operations path) or compose
+        ``M_lm.params @ T_res`` from ``allen_transform_from_landmarks`` (landmarks path).
+
+    Returns
+    -------
+    DataFrame with the same structure but all coordinates in widefield pixel space.
+    """
+    result = ccf_regions.copy()
+    for i, row in result.iterrows():
+        for side in ('left', 'right'):
+            x = np.asarray(row[f'{side}_x'], dtype=float)
+            y = np.asarray(row[f'{side}_y'], dtype=float)
+            xy_px = transform_coordinates(np.column_stack([x, y]), M_fwd)
+            result.at[i, f'{side}_x'] = xy_px[:, 0].tolist()
+            result.at[i, f'{side}_y'] = xy_px[:, 1].tolist()
+            center = np.asarray(row[f'{side}_center'], dtype=float).reshape(1, 2)
+            center_px = transform_coordinates(center, M_fwd)
+            result.at[i, f'{side}_center'] = center_px[0].tolist()
+    return result
 
 

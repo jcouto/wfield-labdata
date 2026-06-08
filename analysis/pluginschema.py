@@ -3,7 +3,8 @@ from labdata.schema import *
 userschema = get_user_schema()
 
 __all__ = ['WfieldParameters', 'WfieldStack', 'ImagingWindow',
-           'ImagingReference','TwoPhotonReferenceAlignment']
+           'ImagingReference','TwoPhotonReferenceAlignment',
+           'WidefieldAtlasTransform']
 
 userschema = get_user_schema()
 
@@ -244,5 +245,72 @@ class TwoPhotonReferenceAlignment(dj.Manual):
         if fov_offset is not None:
             fov_offset = np.asarray(fov_offset).ravel()
         return M_fwd, transpose, fov_offset
+
+
+@userschema
+class WidefieldAtlasTransform(dj.Manual):
+    definition = '''
+    -> Widefield
+    atlas_name         : varchar(24)   # atlas reference name, e.g. 'dorsal_cortex'
+    atlas_transform_id : int           # unique transform per widefield × atlas pair
+    ---
+    transform_type               : enum('landmarks','manual')
+    landmarks = NULL             : longblob   # atlas-space landmarks (dict: x,y,name,color)
+    landmarks_match = NULL       : longblob   # widefield-space landmarks (dict: x,y,name,color)
+    bregma_offset = NULL         : blob       # [x, y] bregma in atlas pixel space (for landmarks path)
+    resolution = NULL            : float      # mm per pixel
+    bregma_xy = NULL             : blob       # [col, row] bregma in widefield image pixels (for operations path)
+    rotation = NULL              : float      # degrees counter-clockwise
+    scale = NULL                 : float      # isotropic scale factor on top of 1/resolution
+    ratio = NULL                 : float      # x/y aspect ratio correction
+    transform_matrix = NULL      : longblob   # 3x3 float64, atlas mm -> widefield px
+    transform_matrix_inverse = NULL : longblob
+    '''
+
+    def get_transform(self):
+        """Return 3x3 ndarray mapping atlas mm coordinates to widefield pixel coordinates."""
+        row = self.fetch1()
+        M = row.get('transform_matrix')
+        if M is not None:
+            return np.asarray(M)
+        return self._build_transform(row)
+
+    def _build_transform(self, row):
+        from .utils import build_atlas_transform
+        t = row['transform_type']
+        if t == 'manual':
+            return build_atlas_transform(
+                bregma_xy=np.asarray(row['bregma_xy']),
+                resolution=float(row['resolution']),
+                rotation=float(row['rotation'] or 0.0),
+                scale=float(row['scale'] or 1.0),
+                ratio=float(row['ratio'] or 1.0),
+            )
+        elif t == 'landmarks':
+            import pandas as pd
+            from wfield import allen_transform_from_landmarks, allen_landmarks_to_image_space
+            bregma_offset = np.asarray(row['bregma_offset'])
+            resolution = float(row['resolution'])
+            landmarks_im = allen_landmarks_to_image_space(
+                pd.DataFrame(row['landmarks']).copy(), bregma_offset, resolution)
+            M_lm = allen_transform_from_landmarks(landmarks_im,
+                                                  pd.DataFrame(row['landmarks_match']))
+            T_res = np.array([[1/resolution, 0, bregma_offset[0]],
+                               [0, 1/resolution, bregma_offset[1]],
+                               [0, 0, 1]], dtype=float)
+            return M_lm.params @ T_res
+        raise ValueError(f'Unknown transform_type: {t!r}')
+
+    def load_reference(self):
+        """Return (ccf_regions, proj, brain_outline) for this atlas."""
+        from wfield import allen_load_reference
+        return allen_load_reference(self.fetch1('atlas_name'))
+
+    def transform_regions(self, ccf_regions=None):
+        """Return ccf_regions DataFrame transformed to widefield pixel coordinates."""
+        from .utils import transform_atlas_regions
+        if ccf_regions is None:
+            ccf_regions, _, _ = self.load_reference()
+        return transform_atlas_regions(ccf_regions, self.get_transform())
 
 
