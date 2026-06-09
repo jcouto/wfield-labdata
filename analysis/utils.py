@@ -113,7 +113,8 @@ def inverse_transform_coordinates(xy, M_fwd):
     return transform_coordinates(xy, np.linalg.inv(M_fwd))
 
 
-def build_atlas_transform(bregma_xy, resolution, rotation=0.0, scale=1.0, ratio=1.0):
+def build_atlas_transform(bregma_xy, resolution, rotation=0.0, scale=1.0, ratio=1.0,
+                          mirror=False):
     """Build a 3×3 forward matrix mapping atlas mm coordinates to widefield pixel coordinates.
 
     Atlas regions are expressed in mm relative to bregma (bregma = origin).
@@ -131,6 +132,8 @@ def build_atlas_transform(bregma_xy, resolution, rotation=0.0, scale=1.0, ratio=
         Additional isotropic scale applied on top of ``1/resolution``.
     ratio : float
         X/Y aspect ratio correction; effective sx = (scale * ratio) / resolution.
+    mirror : bool
+        Flip the atlas x-axis about bregma (for imaging setups where the x-axis is reversed).
 
     Returns
     -------
@@ -141,6 +144,8 @@ def build_atlas_transform(bregma_xy, resolution, rotation=0.0, scale=1.0, ratio=
     cs, sn = np.cos(theta), np.sin(theta)
     sx = float(scale) * float(ratio) / float(resolution)
     sy = float(scale) / float(resolution)
+    if mirror:
+        sx = -sx
     return np.array([[sx * cs, -sy * sn, bregma_col],
                      [sx * sn,  sy * cs, bregma_row],
                      [0,        0,       1          ]], dtype=float)

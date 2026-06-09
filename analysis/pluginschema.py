@@ -401,6 +401,7 @@ class WidefieldAtlasTransform(dj.Manual):
     rotation = NULL              : float      # degrees counter-clockwise
     scale = NULL                 : float      # isotropic scale factor on top of 1/resolution
     ratio = NULL                 : float      # x/y aspect ratio correction
+    mirror = 0                   : tinyint    # 1 = flip atlas x-axis (for reversed imaging setups)
     transform_matrix = NULL      : longblob   # 3x3 float64, atlas mm -> widefield px
     transform_matrix_inverse = NULL : longblob
     '''
@@ -423,6 +424,7 @@ class WidefieldAtlasTransform(dj.Manual):
                 rotation=float(row['rotation'] or 0.0),
                 scale=float(row['scale'] or 1.0),
                 ratio=float(row['ratio'] or 1.0),
+                mirror=bool(row.get('mirror') or False),
             )
         elif t == 'landmarks':
             import pandas as pd

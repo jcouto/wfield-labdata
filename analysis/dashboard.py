@@ -1313,7 +1313,7 @@ def _imaging_reference_tab(schema, WfieldParameters, WfieldStack):
 
 def _render_atlas_overlay(mean_proj, ccf_regions_dict, reference_point,
                           resolution, rotation=0., scale=1., ratio=1.,
-                          circle_params=None):
+                          circle_params=None, mirror=False):
     """Render atlas contours on mean_proj. Returns base64 PNG URL."""
     import matplotlib
     matplotlib.use('Agg')
@@ -1328,6 +1328,7 @@ def _render_atlas_overlay(mean_proj, ccf_regions_dict, reference_point,
         rotation=float(rotation),
         scale=float(scale),
         ratio=float(ratio),
+        mirror=bool(mirror),
     )
     transformed = transform_atlas_regions(regions, M)
 
@@ -1588,15 +1589,16 @@ def _atlas_manual_subtab(sel_key, atlas_name, transform_id,
             rp = np.asarray(saved['reference_point']).ravel()
             st.session_state[f'at_m_{scope}_rx']    = float(rp[0])
             st.session_state[f'at_m_{scope}_ry']    = float(rp[1])
-            st.session_state[f'at_m_{scope}_rot']   = float(saved.get('rotation') or 0.)
-            st.session_state[f'at_m_{scope}_scale'] = float(saved.get('scale')    or 1.)
-            st.session_state[f'at_m_{scope}_ratio'] = float(saved.get('ratio')    or 1.)
-            st.session_state[f'at_m_{scope}_res']   = float(saved.get('resolution') or iw_res)
+            st.session_state[f'at_m_{scope}_rot']    = float(saved.get('rotation') or 0.)
+            st.session_state[f'at_m_{scope}_scale']  = float(saved.get('scale')    or 1.)
+            st.session_state[f'at_m_{scope}_ratio']  = float(saved.get('ratio')    or 1.)
+            st.session_state[f'at_m_{scope}_res']    = float(saved.get('resolution') or iw_res)
+            st.session_state[f'at_m_{scope}_mirror'] = bool(saved.get('mirror') or False)
         else:
             st.session_state[f'at_m_{scope}_res'] = iw_res
         st.session_state[f'at_m_{scope}_init'] = True
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns([2, 2, 2, 2, 1])
     resolution = c1.number_input('Resolution (mm/px)', value=iw_res, step=0.001,
                                   format='%.4f', key=f'at_m_{scope}_res',
                                   help='mm per widefield pixel')
@@ -1606,6 +1608,8 @@ def _atlas_manual_subtab(sel_key, atlas_name, transform_id,
                              key=f'at_m_{scope}_scale')
     ratio      = c4.slider('X/Y ratio',      0.5,   2.0, 1., step=0.01,
                              key=f'at_m_{scope}_ratio')
+    mirror     = c5.checkbox('Mirror X', value=False, key=f'at_m_{scope}_mirror',
+                              help='Flip the atlas left/right (for imaging setups where the x-axis is reversed)')
 
     ref_x = float(st.session_state.get(f'at_m_{scope}_rx', img_w / 2))
     ref_y = float(st.session_state.get(f'at_m_{scope}_ry', img_h / 2))
@@ -1613,7 +1617,7 @@ def _atlas_manual_subtab(sel_key, atlas_name, transform_id,
 
     url = _render_atlas_overlay(mean_proj, atlas_row['ccf_regions'],
                                  [ref_x, ref_y], resolution, rotation, scale, ratio,
-                                 circle_params=iw_circle)
+                                 circle_params=iw_circle, mirror=mirror)
     chart = _altair_clickable(url, img_w, img_h, width=460,
                                title='Click to set bregma · atlas contours overlaid')
     last_key = f'at_m_{scope}_last'
@@ -1637,6 +1641,7 @@ def _atlas_manual_subtab(sel_key, atlas_name, transform_id,
             rotation=float(rotation),
             scale=float(scale),
             ratio=float(ratio),
+            mirror=int(mirror),
         ), replace=True)
         get_existing_transforms.clear()
         st.success(f'Saved manual transform id={transform_id}.')
