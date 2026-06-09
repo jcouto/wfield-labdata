@@ -968,45 +968,132 @@ def _imaging_reference_tab(schema, WfieldParameters, WfieldStack):
             arr = np.array(PILImage.open(local).convert('L'))
         return np.squeeze(arr).astype(np.float32)
 
-    ds_files = get_dataset_files(subject_name, tp_row['session_name'])
-    if not ds_files:
-        st.info('No files in Dataset.DataFiles for this session.')
-        return
-
-    from pathlib import Path
-    file_map = {f"{ds}:  {Path(fp).name}": fp for ds, fp in ds_files}
-    _NO_SEL = '— select a file —'
-    sel_file = st.selectbox('File from DataFiles', [_NO_SEL] + list(file_map.keys()),
-                             key='ir_ds_file')
-    if sel_file == _NO_SEL:
-        st.caption('Select a file to use as the 2P reference image.')
-        return
-
-    fkey = f'ir_fit_{sel_file}'
-    if st.button('↺ Reload file', key='ir_reload_file') and fkey in st.session_state:
-        del st.session_state[fkey]
-    if fkey not in st.session_state:
+    @st.cache_data
+    def get_cell_seg_entries(subject_name, session_name, dataset_name):
         try:
-            with st.spinner('Loading…'):
-                st.session_state[fkey] = load_datafile_raw(file_map[sel_file])
-        except Exception as exc:
-            st.error(f'Failed to load {sel_file}: {exc}')
+            from labdata.schema import CellSegmentation, CellSegmentationParams
+            rows = list((CellSegmentation & dict(subject_name=subject_name,
+                                                 session_name=session_name,
+                                                 dataset_name=dataset_name)).fetch(
+                'parameter_set_num', 'n_rois', as_dict=True))
+            if not rows:
+                return []
+            param_keys = [dict(parameter_set_num=r['parameter_set_num']) for r in rows]
+            params = {p['parameter_set_num']: p for p in
+                      (CellSegmentationParams & param_keys).fetch(as_dict=True)}
+            for r in rows:
+                p = params.get(r['parameter_set_num'], {})
+                r['label'] = (f"params={r['parameter_set_num']} "
+                              f"({p.get('algorithm_name', '?')}, {r['n_rois']} ROIs)")
+            return rows
+        except Exception:
+            return []
+
+    @st.cache_data
+    def get_cell_seg_proj_list(subject_name, session_name, dataset_name, parameter_set_num):
+        try:
+            from labdata.schema import CellSegmentation
+            key = dict(subject_name=subject_name, session_name=session_name,
+                       dataset_name=dataset_name, parameter_set_num=parameter_set_num)
+            return list((CellSegmentation.Projection & key).fetch(
+                'plane_num', 'proj_name', as_dict=True))
+        except Exception:
+            return []
+
+    @st.cache_data
+    def load_cell_seg_proj(subject_name, session_name, dataset_name,
+                           parameter_set_num, plane_num, proj_name):
+        from labdata.schema import CellSegmentation
+        key = dict(subject_name=subject_name, session_name=session_name,
+                   dataset_name=dataset_name, parameter_set_num=parameter_set_num,
+                   plane_num=plane_num, proj_name=proj_name)
+        return np.squeeze(np.asarray(
+            (CellSegmentation.Projection & key).fetch1('proj_im')
+        )).astype(np.float32)
+
+    src_type = st.radio('Image source', ['File from DataFiles', 'CellSegmentation projection'],
+                        horizontal=True, key='ir_src_type')
+
+    if src_type == 'File from DataFiles':
+        ds_files = get_dataset_files(subject_name, tp_row['session_name'])
+        if not ds_files:
+            st.info('No files in Dataset.DataFiles for this session.')
             return
 
-    raw_img = st.session_state[fkey]
+        from pathlib import Path
+        file_map = {f"{ds}:  {Path(fp).name}": fp for ds, fp in ds_files}
+        _NO_SEL = '— select a file —'
+        sel_file = st.selectbox('File from DataFiles', [_NO_SEL] + list(file_map.keys()),
+                                 key='ir_ds_file')
+        if sel_file == _NO_SEL:
+            st.caption('Select a file to use as the 2P reference image.')
+            return
 
-    # Channel selector — shown only when the array has >2 dims
-    if raw_img.ndim > 2:
-        # Find the channel axis: smallest dimension
-        ch_ax = int(np.argmin(raw_img.shape))
-        n_ch  = raw_img.shape[ch_ax]
-        sel_ch = st.selectbox(f'Channel (axis {ch_ax}, {n_ch} available)',
-                              list(range(n_ch)), key='ir_ch_sel')
-        fit_img = np.take(raw_img, sel_ch, axis=ch_ax)
-    else:
-        fit_img = raw_img
+        fkey = f'ir_fit_{sel_file}'
+        if st.button('↺ Reload file', key='ir_reload_file') and fkey in st.session_state:
+            del st.session_state[fkey]
+        if fkey not in st.session_state:
+            try:
+                with st.spinner('Loading…'):
+                    st.session_state[fkey] = load_datafile_raw(file_map[sel_file])
+            except Exception as exc:
+                st.error(f'Failed to load {sel_file}: {exc}')
+                return
 
-    st.caption(f'2P image: {raw_img.shape}  →  using {fit_img.shape[0]} rows × {fit_img.shape[1]} cols')
+        raw_img = st.session_state[fkey]
+
+        if raw_img.ndim > 2:
+            ch_ax = int(np.argmin(raw_img.shape))
+            n_ch  = raw_img.shape[ch_ax]
+            sel_ch = st.selectbox(f'Channel (axis {ch_ax}, {n_ch} available)',
+                                  list(range(n_ch)), key='ir_ch_sel')
+            fit_img = np.take(raw_img, sel_ch, axis=ch_ax)
+        else:
+            fit_img = raw_img
+
+        st.caption(f'2P image: {raw_img.shape}  →  using {fit_img.shape[0]} rows × {fit_img.shape[1]} cols')
+
+    else:  # CellSegmentation projection
+        cs_entries = get_cell_seg_entries(subject_name, tp_row['session_name'],
+                                          tp_row['dataset_name'])
+        if not cs_entries:
+            st.info('No CellSegmentation entries found for this dataset.')
+            return
+
+        cs_labels = [r['label'] for r in cs_entries]
+        sel_cs_lbl = st.selectbox('CellSegmentation entry', cs_labels, key='ir_cs_entry')
+        cs_row = cs_entries[cs_labels.index(sel_cs_lbl)]
+
+        proj_rows = get_cell_seg_proj_list(subject_name, tp_row['session_name'],
+                                           tp_row['dataset_name'],
+                                           cs_row['parameter_set_num'])
+        if not proj_rows:
+            st.info('No projections found for this segmentation entry.')
+            return
+
+        planes     = sorted(set(r['plane_num'] for r in proj_rows))
+        proj_names = sorted(set(r['proj_name'] for r in proj_rows))
+
+        pc1, pc2 = st.columns(2)
+        sel_plane = pc1.selectbox('Plane', planes, key='ir_cs_plane')
+        sel_proj  = pc2.selectbox('Projection', proj_names, key='ir_cs_proj')
+
+        cs_img_key = f'ir_cs_{cs_row["parameter_set_num"]}_{sel_plane}_{sel_proj}'
+        if st.button('↺ Reload projection', key='ir_cs_reload') and cs_img_key in st.session_state:
+            del st.session_state[cs_img_key]
+        if cs_img_key not in st.session_state:
+            try:
+                with st.spinner('Loading projection…'):
+                    st.session_state[cs_img_key] = load_cell_seg_proj(
+                        subject_name, tp_row['session_name'], tp_row['dataset_name'],
+                        cs_row['parameter_set_num'], sel_plane, sel_proj)
+            except Exception as exc:
+                st.error(f'Failed to load projection: {exc}')
+                return
+
+        fit_img = st.session_state[cs_img_key]
+        st.caption(f'CellSegmentation projection: plane={sel_plane}, proj={sel_proj}, '
+                   f'shape={fit_img.shape[0]} rows × {fit_img.shape[1]} cols')
 
     ref_img_full = get_stored_ref_image(subject_name, sel_ref_num)
     if ref_img_full is None:
