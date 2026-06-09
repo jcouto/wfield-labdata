@@ -59,7 +59,14 @@ class WfieldStack(dj.Computed):
         import string
         par = (WfieldParameters() & key).fetch1()
         
-        dat = (Widefield & key).open()
+        try:
+            dat = (Widefield & key).open()
+        except ValueError:
+            # try tif files
+            files = (File & (Dataset.DataFiles & (Dataset & (Widefield & key)) & 'file_path LIKE "%.tif"' & 'file_path NOT LIKE "%ref%"')).get()
+            if len(files):
+                from wfield import TiffStack
+                dat = TiffStack(natsorted([str(f) for f in files]),nchannels = (Widefield & key).fetch1('n_channels'))
         # work in the scratch folder
         rand = ''.join(np.random.choice([s for s in string.ascii_lowercase + string.digits],9))
         scratch_folder = Path(prefs['scratch_path'])/f'wfield_{rand}'
