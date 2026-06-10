@@ -969,6 +969,14 @@ def _imaging_reference_tab(schema, WfieldParameters, WfieldStack):
         return np.squeeze(arr).astype(np.float32)
 
     @st.cache_data
+    def get_saved_alignment(subject_name, ref_num, session_name, dataset_name):
+        rows = (TwoPhotonReferenceAlignment & dict(
+            subject_name=subject_name, ref_num=ref_num,
+            session_name=session_name, dataset_name=dataset_name,
+        )).fetch(as_dict=True)
+        return rows[0] if rows else None
+
+    @st.cache_data
     def get_cell_seg_entries(subject_name, session_name, dataset_name):
         try:
             from labdata.schema import CellSegmentation, CellSegmentationParams
@@ -1104,16 +1112,15 @@ def _imaging_reference_tab(schema, WfieldParameters, WfieldStack):
     ref_img = ref_img_full
     rh, rw  = ref_img.shape
 
-    @st.cache_data
-    def get_saved_alignment(subject_name, ref_num, session_name, dataset_name):
-        rows = (TwoPhotonReferenceAlignment & dict(
-            subject_name=subject_name, ref_num=ref_num,
-            session_name=session_name, dataset_name=dataset_name,
-        )).fetch(as_dict=True)
-        return rows[0] if rows else None
-
     # Load existing alignment when the scope changes
-    align_scope = f'{sel_ref_num}|{tp_row["session_name"]}|{tp_row["dataset_name"]}'
+    # For CellSegmentation source, include the selected CS entry so switching entries
+    # also triggers a reload (alignment is per session/dataset but this ensures the
+    # DB is always re-read when the user picks a new CS entry).
+    if src_type == 'CellSegmentation projection':
+        align_scope = (f'{sel_ref_num}|cs|{tp_row["session_name"]}|{tp_row["dataset_name"]}'
+                       f'|{st.session_state.get("ir_cs_entry", "")}')
+    else:
+        align_scope = f'{sel_ref_num}|{tp_row["session_name"]}|{tp_row["dataset_name"]}'
     if st.session_state.get('ir_align_scope') != align_scope:
         st.session_state['ir_align_scope'] = align_scope
         st.session_state.pop('ir_align_last', None)

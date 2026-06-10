@@ -203,9 +203,171 @@ class ImagingReference(dj.Manual):
     -> Subject
     ref_num                      : smallint
     ---
-    -> Widefield.proj(ref_session = "session_name",ref_dataset = "dataset_name") 
+    -> Widefield.proj(ref_session = "session_name",ref_dataset = "dataset_name")
     ref_image                    : longblob                                        # the reference image (uint16)
     """
+
+    def plot_rois(self, ax=None, proj_name='mean', cell_seg_params=None,
+                  alpha=0.5, roi_color='cyan', fov_color='yellow', **kwargs):
+        """Plot CellSegmentation ROIs from all aligned 2P datasets onto the reference image.
+
+        For every TwoPhotonReferenceAlignment linked to this entry the method
+        locates the matching CellSegmentation entries, warps their ROI contours
+        and (optionally) a summary projection into reference-image space, and
+        draws a rectangle marking the 2P field of view.
+
+        Parameters
+        ----------
+        ax : matplotlib Axes, optional
+            Target axes; a new figure is created when None.
+        proj_name : str or None
+            CellSegmentation projection to overlay (e.g. 'mean', 'max',
+            'correlation'). Pass None to skip the projection overlay.
+        cell_seg_params : int or list of int, optional
+            Restrict to specific CellSegmentationParams parameter_set_num(s).
+            All available segmentations are shown when None.
+        alpha : float
+            Opacity for ROI contour lines and projection overlay. Default 0.5.
+        roi_color : color
+            Matplotlib color for ROI contour lines.
+        fov_color : color
+            Matplotlib color for the FOV boundary rectangle.
+        **kwargs
+            Extra keyword arguments forwarded to ax.plot() for ROI contours
+            (e.g. lw, linestyle).
+
+        Returns
+        -------
+        ax : matplotlib Axes
+        """
+        import matplotlib.pyplot as plt
+        from labdata.schema import CellSegmentation
+        from .utils import transform_coordinates, warp_image
+
+        ref_img = np.squeeze(np.asarray(self.fetch1('ref_image'))).astype(np.float32)
+        rh, rw = ref_img.shape[:2]
+
+        alignments = (TwoPhotonReferenceAlignment & self).fetch(as_dict=True)
+        if not alignments:
+            raise ValueError('No TwoPhotonReferenceAlignment entries for this ImagingReference.')
+
+        if ax is None:
+            _, ax = plt.subplots(figsize=(6, 6 * rh / rw))
+
+        lo_r, hi_r = np.percentile(ref_img, [1, 99])
+        ax.imshow(ref_img, cmap='gray', origin='upper', aspect='equal',
+                  vmin=lo_r, vmax=hi_r)
+
+        for align in alignments:
+            subject_name = align['subject_name']
+            session_name = align['session_name']
+            dataset_name = align['dataset_name']
+
+            fov_offset = align.get('fov_offset')
+            if fov_offset is not None:
+                fov_offset = np.asarray(fov_offset).ravel()
+                row_off, col_off = int(fov_offset[0]), int(fov_offset[1])
+            else:
+                row_off = col_off = 0
+
+            # Locate CellSegmentation entries for this 2P dataset
+            cs_base = dict(subject_name=subject_name, session_name=session_name,
+                           dataset_name=dataset_name)
+            if cell_seg_params is not None:
+                params = ([cell_seg_params] if isinstance(cell_seg_params, (int, np.integer))
+                          else list(cell_seg_params))
+                cs_restrict = [dict(**cs_base, parameter_set_num=p) for p in params]
+            else:
+                cs_restrict = cs_base
+
+            param_nums = list((CellSegmentation & cs_restrict).fetch('parameter_set_num'))
+            if not param_nums:
+                continue
+
+            for param_num in param_nums:
+                plane_key_base = dict(**cs_base, parameter_set_num=param_num)
+                plane_rows = (CellSegmentation.Plane & plane_key_base).fetch(
+                    'plane_num', 'dims', as_dict=True)
+
+                for plane_row in plane_rows:
+                    plane_num = plane_row['plane_num']
+                    plane_key = dict(**plane_key_base, plane_num=plane_num)
+
+                    # Raw 2P image dimensions for building the transform
+                    dims = plane_row.get('dims')
+                    if dims is not None:
+                        dims = np.asarray(dims).ravel()
+                        fh_seg, fw_seg = int(dims[0]), int(dims[1])
+                    else:
+                        proj_fallback = (CellSegmentation.Projection & plane_key).fetch(
+                            'proj_im', limit=1)
+                        if not len(proj_fallback):
+                            continue
+                        fh_seg, fw_seg = np.squeeze(np.asarray(proj_fallback[0])).shape[:2]
+
+                    fw_raw = fw_seg + col_off
+                    fh_raw = fh_seg + row_off
+
+                    M_fwd, transpose, _ = (TwoPhotonReferenceAlignment & align).get_transform(
+                        fw_raw, fh_raw)
+
+                    # Overlay CellSegmentation projection
+                    if proj_name is not None:
+                        proj_data = (CellSegmentation.Projection
+                                     & dict(**plane_key, proj_name=proj_name)).fetch('proj_im')
+                        if len(proj_data):
+                            proj_im = np.squeeze(np.asarray(proj_data[0])).astype(np.float32)
+                            if row_off or col_off:
+                                padded = np.zeros((fh_raw, fw_raw), dtype=np.float32)
+                                padded[row_off:row_off + fh_seg,
+                                       col_off:col_off + fw_seg] = proj_im
+                                proj_im = padded
+                            if transpose:
+                                proj_im = proj_im.T
+                            warped = warp_image(proj_im, M_fwd, (rh, rw))
+                            fov_mask = warped > 0
+                            if fov_mask.any():
+                                lo_p, hi_p = np.percentile(warped[fov_mask], [2, 98])
+                                proj_norm = np.clip(
+                                    (warped - lo_p) / max(hi_p - lo_p, 1e-9), 0, 1)
+                                cmap = plt.get_cmap('hot')
+                                rgba = cmap(proj_norm)
+                                rgba[..., 3] = fov_mask.astype(float) * alpha
+                                ax.imshow(rgba, origin='upper', aspect='equal')
+
+                    # ROI contours
+                    rois = CellSegmentation.ROI & plane_key
+                    if len(rois):
+                        contours = rois.get_roi_contours()
+                        kw = dict(lw=0.5, alpha=alpha, color=roi_color)
+                        kw.update(kwargs)
+                        for contour in contours:
+                            if contour is None:
+                                continue
+                            # contour columns: [x=col, y=row] in segmentation space
+                            xy = contour.astype(float)
+                            if transpose:
+                                xy = np.column_stack([xy[:, 1] + row_off,
+                                                      xy[:, 0] + col_off])
+                            else:
+                                xy = np.column_stack([xy[:, 0] + col_off,
+                                                      xy[:, 1] + row_off])
+                            ax.plot(*transform_coordinates(xy, M_fwd).T, **kw)
+
+                    # FOV boundary rectangle (corners in post-transpose aligned space)
+                    afw = fh_raw if transpose else fw_raw
+                    afh = fw_raw if transpose else fh_raw
+                    corners = np.array([[0, 0], [afw, 0], [afw, afh],
+                                        [0, afh], [0, 0]], dtype=float)
+                    corners_ref = transform_coordinates(corners, M_fwd)
+                    ax.plot(corners_ref[:, 0], corners_ref[:, 1],
+                            '-', color=fov_color, lw=1.5, alpha=0.8)
+
+        ax.set_xlim(0, rw)
+        ax.set_ylim(rh, 0)
+        ax.axis('off')
+        return ax
+
 
 @userschema
 class TwoPhotonReferenceAlignment(dj.Manual):
