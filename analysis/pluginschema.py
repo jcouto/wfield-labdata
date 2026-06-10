@@ -308,7 +308,11 @@ class ImagingReference(dj.Manual):
                     fw_raw = fw_seg + col_off
                     fh_raw = fh_seg + row_off
 
-                    M_fwd, transpose, _ = (TwoPhotonReferenceAlignment & align).get_transform(
+                    align_key = dict(subject_name=align['subject_name'],
+                                     ref_num=align['ref_num'],
+                                     session_name=align['session_name'],
+                                     dataset_name=align['dataset_name'])
+                    M_fwd, transpose, _ = (TwoPhotonReferenceAlignment & align_key).get_transform(
                         fw_raw, fh_raw)
 
                     # Overlay CellSegmentation projection
