@@ -6,6 +6,8 @@
 
 **Atlas registration:** `WidefieldAtlas`, `WidefieldAtlasTransform`
 
+**Two-photon registration:** `ImagingReference`, `TwoPhotonReferenceAlignment`, `CellSegmentationAtlas`
+
 **Stimulus responses:** `WidefieldResponse`, `WidefieldResponse.Projection`
 
 ---
@@ -186,7 +188,7 @@ atlas.plot_regions(ax=ax, acronyms=['VISp', 'SSp-bfd', 'RSPv'])  # selected regi
 
 ### WidefieldAtlasTransform
 
-Links a `Widefield` recording to a `WidefieldAtlas` entry with a spatial transform. Supports two registration modes.
+Links a `Widefield` recording to a `WidefieldAtlas` entry with a spatial transform — the widefield session is what gets aligned to the atlas. Keyed on `(subject_name, session_name, dataset_name, atlas_name, atlas_transform_id)`. Supports two registration modes.
 
 **Manual** — specify where bregma is in the widefield image and adjust scale/rotation until the contours align:
 
@@ -241,7 +243,7 @@ xfm.plot_regions(ax=ax)
 xfm.plot_regions(ax=ax, acronyms=['VISp', 'RSPv'])
 ```
 
-The dashboard **Atlas Alignment** tab provides an interactive GUI for both modes, with live preview.
+The dashboard **Atlas Alignment** tab provides an interactive GUI for both modes, with live preview, registering the widefield session selected in the Sessions tab (using its `WfieldStack` mean projection or a `WidefieldResponse` map as the backdrop). The manual mode includes a **Mirror X** toggle for recordings acquired with a flipped (mirror-image) field of view.
 
 | Field | Description |
 |---|---|
@@ -252,9 +254,100 @@ The dashboard **Atlas Alignment** tab provides an interactive GUI for both modes
 | `rotation` | Degrees counter-clockwise (manual path) |
 | `scale` | Isotropic scale on top of `1/resolution` (manual path) |
 | `ratio` | X/Y aspect ratio correction (manual path) |
+| `mirror` | `1` flips the atlas left/right about bregma — for setups where the imaging x-axis is reversed (manual path; default `0`) |
 | `landmarks` | Atlas-space landmarks as dict with keys `x`, `y`, `name`, `color` (landmarks path) |
 | `landmarks_match` | Corresponding widefield pixel coordinates, same format (landmarks path) |
 | `transform_matrix` | Cached 3×3 float64 matrix (atlas mm → widefield px); populated on first `get_transform()` call |
+
+---
+
+## Two-photon registration & cell atlas
+
+Two-photon datasets are tied to the widefield map in two steps: align the 2P field of view to a stored widefield **reference image**, then reuse the widefield's atlas transform to place each segmented cell in Allen CCF coordinates.
+
+### ImagingReference
+
+A reference widefield image for a subject (typically a `WfieldStack` mean projection, or a separately acquired image). One or more per subject, keyed by `ref_num`.
+
+```python
+ImagingReference.insert1(dict(
+    subject_name='subject001',
+    ref_num=0,
+    ref_session='2024-01-15',          # widefield session this image comes from
+    ref_dataset='wfield_00',
+    ref_image=mean_image.astype('uint16'),
+))
+```
+
+The dashboard **Imaging Reference** tab creates these from any `WfieldStack` mean projection (or a `.tif`/`.mat` file in the session) with the imaging window circle overlaid.
+
+### TwoPhotonReferenceAlignment
+
+Stores the transform mapping a `TwoPhoton` dataset into an `ImagingReference` image. Build it interactively in the **Imaging Reference** tab: pick the reference and a 2P image source — either a raw file from `Dataset.DataFiles` or a **`CellSegmentation` projection** (mean / max / correlation) — then adjust rotation, scale, X/Y ratio, transpose, and origin until the FOV overlay lines up, and save.
+
+When you reselect a `CellSegmentation` entry that already has a saved alignment, the sliders are repopulated from the stored transform. An optional **FOV offset** accounts for rows/columns dropped at the edge of the segmentation output relative to the raw 2P frame.
+
+```python
+align = (TwoPhotonReferenceAlignment
+         & dict(subject_name='subject001', ref_num=0)
+         & dict(session_name='2024-02-01', dataset_name='twophoton_00'))
+
+# Forward affine for a raw 2P image of width fw, height fh:
+M_fwd, transpose, fov_offset = align.get_transform(fw, fh)   # 2P (col,row) → reference px
+```
+
+Overlay every aligned 2P dataset's `CellSegmentation` projections back onto a reference image, with a rectangle marking each field of view:
+
+```python
+ref = ImagingReference & dict(subject_name='subject001', ref_num=0)
+
+import matplotlib.pyplot as plt
+fig, ax = plt.subplots()
+ref.overlay_projections_on_reference(ax=ax, proj_name='mean')   # 'mean' | 'max' | 'correlation'
+ref.overlay_projections_on_reference(ax=ax, cell_seg_params=2)  # restrict to one segmentation run
+```
+
+| Field | Description |
+|---|---|
+| `rotation` | Rotation applied to the 2P image (degrees) |
+| `scale` | 2P-pixel → reference-pixel scale |
+| `ratio` | X/Y aspect ratio correction |
+| `transpose` | Whether the 2P image is transposed before warping |
+| `origin` | `[col, row]` of the 2P centre in reference pixels |
+| `fov_offset` | Optional `[row, col]` offset if the segmentation output is cropped |
+
+### CellSegmentationAtlas
+
+A **computed** table that places every `CellSegmentation.ROI` in atlas coordinates and assigns it to a cortical region. It combines three parents: the `CellSegmentation` result, a `TwoPhotonReferenceAlignment` (2P → widefield reference image), and a `WidefieldAtlasTransform` (widefield → atlas). Since the atlas transform is keyed on the widefield session — a *different* session from the 2P data — its session columns are exposed as `ref_session` / `ref_dataset`, and `key_source` constrains them (through the alignment's `ImagingReference`) to the widefield the reference points at.
+
+```python
+# Requires an ImagingReference, a saved TwoPhotonReferenceAlignment, and a
+# WidefieldAtlasTransform on the reference's widefield session.
+CellSegmentationAtlas.populate(display_progress=True)
+```
+
+For each ROI the make method computes the centroid in segmentation space, maps it 2P → reference pixels → atlas mm, and tests it against each region's left/right contour with `cv2.pointPolygonTest`:
+
+```python
+rois = (CellSegmentationAtlas.ROI
+        & dict(subject_name='subject001', session_name='2024-02-01')).fetch(as_dict=True)
+rois[0]['atlas_x'], rois[0]['atlas_y']    # ML / AP position, mm from bregma
+rois[0]['acronym']                         # Allen region (NULL if outside all regions)
+rois[0]['hemisphere']                      # 'left' or 'right'
+rois[0]['region_distance']                 # signed distance to region edge, mm (+ inside)
+```
+
+| Field | Description |
+|---|---|
+| `n_rois` | Total ROIs placed (master) |
+| `n_in_atlas` | ROIs that landed inside a region (master) |
+| `atlas_x` | ML position, mm from bregma (`+` = right) |
+| `atlas_y` | AP position, mm from bregma (`+` = posterior) |
+| `hemisphere` | `'left'` / `'right'` of the matched region |
+| `acronym` | Allen region acronym; `NULL` when outside all regions |
+| `region_distance` | Signed distance to the region edge, mm (`+` inside), via `cv2.pointPolygonTest` |
+
+The dashboard **Cell Atlas** tab drives the whole flow: a **Populate** button (showing populated vs. pending counts), multiselects to pick sessions across one or several subjects, and a scatter of ROI positions over the atlas contours — coloured by session, subject, or region, with a per-region count table.
 
 ---
 

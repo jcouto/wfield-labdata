@@ -58,12 +58,36 @@ def _altair_image(url, w, h, title='', width=400, height=None):
     )
 
 
+def _tab_cache_factory(refresh_key):
+    """Return a decorator like ``st.cache_data`` that also wires a cache into a
+    per-tab refresh button. When the tab's refresh flag is set (the button was
+    clicked on the previous run), each cache is cleared as it is recreated — so
+    only the current tab's data reloads, leaving other tabs' caches warm."""
+    do_clear = st.session_state.pop(refresh_key, False)
+
+    def cache(func):
+        cached = st.cache_data(func)
+        if do_clear:
+            cached.clear()
+        return cached
+    return cache
+
+
+def _refresh_button(refresh_key, label='↻ Refresh'):
+    """Render a per-tab refresh button that reloads this tab's data on next run."""
+    if st.button(label, key=f'{refresh_key}_btn',
+                 help="Reload this tab's data from the database"):
+        st.session_state[refresh_key] = True
+        st.rerun()
+
+
 def dashboard_function(schema=None):
     from .pluginschema import WfieldParameters, WfieldStack
     st.write('## Widefield')
-    sessions_tab, results_tab, explorer_tab, mask_tab, ref_tab, atlas_tab = st.tabs(
+    (sessions_tab, results_tab, explorer_tab, mask_tab,
+     ref_tab, atlas_tab, cell_atlas_tab) = st.tabs(
         ['Sessions & Parameters', 'Projections', 'Stack explorer', 'Window mask',
-         'Imaging Reference', 'Atlas Alignment'])
+         'Imaging Reference', 'Atlas Alignment', 'Cell Atlas'])
     with sessions_tab:
         _sessions_params_tab(schema, WfieldParameters, WfieldStack)
     with results_tab:
@@ -76,14 +100,18 @@ def dashboard_function(schema=None):
         _imaging_reference_tab(schema, WfieldParameters, WfieldStack)
     with atlas_tab:
         _atlas_alignment_tab(schema, WfieldParameters, WfieldStack)
+    with cell_atlas_tab:
+        _cell_atlas_tab(schema)
 
 
 
 
 def _sessions_params_tab(schema, WfieldParameters, WfieldStack):
     import altair as alt
+    cache = _tab_cache_factory('refresh_sessions')
+    _refresh_button('refresh_sessions')
 
-    @st.cache_data
+    @cache
     def get_table_counts():
         counts = {}
         for name, tbl in [
@@ -103,11 +131,11 @@ def _sessions_params_tab(schema, WfieldParameters, WfieldStack):
     for col, (name, val) in zip(m_cols, counts.items()):
         col.metric(name, '—' if val is None else val)
 
-    @st.cache_data
+    @cache
     def get_subjects():
         return list((schema.Subject & schema.Widefield).fetch('subject_name'))
 
-    @st.cache_data
+    @cache
     def get_subject_counts():
         rows = (schema.Widefield * schema.Dataset * schema.Session).fetch(
             'subject_name', as_dict=True)
@@ -142,7 +170,7 @@ def _sessions_params_tab(schema, WfieldParameters, WfieldStack):
     if not subject:
         return
 
-    @st.cache_data
+    @cache
     def get_sessions(subject_name):
         rows = (schema.Widefield * schema.Dataset * schema.Session
                 & dict(subject_name=subject_name)).fetch(
@@ -206,7 +234,7 @@ def _sessions_params_tab(schema, WfieldParameters, WfieldStack):
 
 
 
-    @st.cache_data
+    @cache
     def get_params(subject_name, session_name, dataset_name):
         rows = (WfieldParameters & dict(
             subject_name=subject_name,
@@ -251,6 +279,7 @@ def _sessions_params_tab(schema, WfieldParameters, WfieldStack):
                             WfieldStack.populate(pop_key, display_progress=False)
                             get_params.clear()
                             get_sessions.clear()
+                            get_table_counts.clear()
                             st.success('Done.')
                             st.rerun()
                         except Exception as exc:
@@ -297,6 +326,7 @@ def _sessions_params_tab(schema, WfieldParameters, WfieldStack):
                 WfieldParameters.insert1(new_row)
                 get_params.clear()
                 get_sessions.clear()
+                get_table_counts.clear()
                 st.success(f'Inserted wfield_analysis_id={analysis_id}.')
                 st.rerun()
             except Exception as exc:
@@ -313,8 +343,10 @@ def _results_tab(schema, WfieldParameters, WfieldStack):
         return
 
     st.write(f"**{sel_key['session_name']}** / {sel_key['dataset_name']}")
+    cache = _tab_cache_factory('refresh_results')
+    _refresh_button('refresh_results')
 
-    @st.cache_data
+    @cache
     def get_stack_entries(subject_name, session_name, dataset_name):
         return (WfieldStack & dict(
             subject_name=subject_name,
@@ -332,20 +364,20 @@ def _results_tab(schema, WfieldParameters, WfieldStack):
     analysis_id = st.selectbox('wfield_analysis_id', analysis_ids)
     stack_key = dict(**sel_key, wfield_analysis_id=int(analysis_id))
 
-    @st.cache_data
+    @cache
     def get_mean_proj(subject_name, session_name, dataset_name, analysis_id):
         key = dict(subject_name=subject_name, session_name=session_name,
                    dataset_name=dataset_name, wfield_analysis_id=analysis_id)
         return (WfieldStack & key).fetch1('mean_proj')
 
-    @st.cache_data
+    @cache
     def get_projections_raw(subject_name, session_name, dataset_name, analysis_id):
         key = dict(subject_name=subject_name, session_name=session_name,
                    dataset_name=dataset_name, wfield_analysis_id=analysis_id)
         rows = (WfieldStack.Projection & key).fetch('proj_name', 'proj', as_dict=True)
         return [(r['proj_name'], np.asarray(r['proj'])) for r in rows]
 
-    @st.cache_data
+    @cache
     def get_motion(subject_name, session_name, dataset_name, analysis_id):
         key = dict(subject_name=subject_name, session_name=session_name,
                    dataset_name=dataset_name, wfield_analysis_id=analysis_id)
@@ -493,8 +525,10 @@ def _stack_explorer_tab(schema, WfieldParameters, WfieldStack):
     if not sel_key:
         st.info('Select a session in the Sessions & Parameters tab first.')
         return
+    cache = _tab_cache_factory('refresh_explorer')
+    _refresh_button('refresh_explorer')
 
-    @st.cache_data
+    @cache
     def get_stack_ids_exp(subject_name, session_name, dataset_name):
         return list((WfieldStack & dict(
             subject_name=subject_name, session_name=session_name,
@@ -534,9 +568,10 @@ def _window_mask_tab(schema, WfieldParameters, WfieldStack):
     widefield_key = dict(subject_name=subject_name,
                          session_name=session_name,
                          dataset_name=dataset_name)
+    cache = _tab_cache_factory('refresh_window')
+    _refresh_button('refresh_window')
 
-
-    @st.cache_data
+    @cache
     def get_imaging_window(subject_name, session_name, dataset_name):
         rows = (ImagingWindow & widefield_key).fetch(as_dict=True)
         return rows[0] if rows else None
@@ -554,7 +589,7 @@ def _window_mask_tab(schema, WfieldParameters, WfieldStack):
         st.success('ImagingWindow entry exists — ' + ('  |  '.join(info_parts) if info_parts else ''))
 
 
-    @st.cache_data
+    @cache
     def get_stack_ids(subject_name, session_name, dataset_name):
         return list((WfieldStack & widefield_key).fetch('wfield_analysis_id', as_dict=False))
 
@@ -570,7 +605,7 @@ def _window_mask_tab(schema, WfieldParameters, WfieldStack):
         col_sel.info('No WfieldStack results — cannot display a reference image.')
         return
 
-    @st.cache_data
+    @cache
     def get_image(subject_name, session_name, dataset_name, analysis_id):
         key = dict(subject_name=subject_name, session_name=session_name,
                    dataset_name=dataset_name, wfield_analysis_id=analysis_id)
@@ -755,8 +790,10 @@ def _imaging_reference_tab(schema, WfieldParameters, WfieldStack):
 
 
     st.subheader('Widefield Reference')
+    cache = _tab_cache_factory('refresh_imaging_ref')
+    _refresh_button('refresh_imaging_ref')
 
-    @st.cache_data
+    @cache
     def get_imaging_refs(subject_name):
         rows = (ImagingReference & dict(subject_name=subject_name)).fetch(
             'ref_num', 'ref_session', 'ref_dataset', as_dict=True)
@@ -764,12 +801,20 @@ def _imaging_reference_tab(schema, WfieldParameters, WfieldStack):
             return pd.DataFrame()
         return pd.DataFrame(rows).sort_values('ref_num').reset_index(drop=True)
 
-    @st.cache_data
+    @cache
+    def get_stored_ref_image(subject_name, ref_num):
+        rows = (ImagingReference & dict(subject_name=subject_name,
+                                         ref_num=ref_num)).fetch(as_dict=True)
+        if not rows:
+            return None
+        return np.squeeze(np.asarray(rows[0]['ref_image'])).astype(np.float32)
+
+    @cache
     def get_wf_stacks(subject_name):
         return list((WfieldStack & dict(subject_name=subject_name)).fetch(
             'session_name', 'dataset_name', 'wfield_analysis_id', as_dict=True))
 
-    @st.cache_data
+    @cache
     def get_wf_mean_for_ref(subject_name, session_name, dataset_name, analysis_id):
         key = dict(subject_name=subject_name, session_name=session_name,
                    dataset_name=dataset_name, wfield_analysis_id=analysis_id)
@@ -779,14 +824,14 @@ def _imaging_reference_tab(schema, WfieldParameters, WfieldStack):
             arr = arr[0]
         return arr.astype(np.float32)
 
-    @st.cache_data
+    @cache
     def get_window_for_session(subject_name, session_name, dataset_name):
         rows = (ImagingWindow & dict(subject_name=subject_name,
                                      session_name=session_name,
                                      dataset_name=dataset_name)).fetch(as_dict=True)
         return rows[0] if rows else None
 
-    @st.cache_data
+    @cache
     def get_session_ref_files(subject_name, session_name):
         rows = (schema.Dataset.DataFiles
                 & dict(subject_name=subject_name, session_name=session_name)
@@ -795,7 +840,7 @@ def _imaging_reference_tab(schema, WfieldParameters, WfieldStack):
                 for r in rows
                 if r['file_path'].lower().endswith(('.tif', '.tiff', '.mat'))]
 
-    @st.cache_data
+    @cache
     def load_ref_file(file_path):
         local = (schema.File & dict(file_path=file_path)).get()[0]
         if str(local).lower().endswith('.mat'):
@@ -882,6 +927,7 @@ def _imaging_reference_tab(schema, WfieldParameters, WfieldStack):
                         ref_image=raw_ref.astype(np.uint16),
                     ), replace=True)
                     get_imaging_refs.clear()
+                    get_stored_ref_image.clear()
                     st.success(f'Saved ImagingReference ref_num={ref_num} '
                                f'({rsess} / {rdset})')
                     st.rerun()
@@ -896,14 +942,14 @@ def _imaging_reference_tab(schema, WfieldParameters, WfieldStack):
         st.info('Create an ImagingReference above first.')
         return
 
-    @st.cache_data
+    @cache
     def get_2p_alignments(subject_name):
         rows = (TwoPhotonReferenceAlignment & dict(subject_name=subject_name)).fetch(
             'ref_num', 'session_name', 'dataset_name',
             'rotation', 'scale', 'transpose', 'ratio', as_dict=True)
         return pd.DataFrame(rows) if rows else pd.DataFrame()
 
-    @st.cache_data
+    @cache
     def get_tp_sessions(subject_name):
         try:
             from labdata.schema import TwoPhoton
@@ -911,14 +957,6 @@ def _imaging_reference_tab(schema, WfieldParameters, WfieldStack):
                 'session_name', 'dataset_name', 'n_planes', 'n_channels', as_dict=True))
         except Exception:
             return []
-
-    @st.cache_data
-    def get_stored_ref_image(subject_name, ref_num):
-        rows = (ImagingReference & dict(subject_name=subject_name,
-                                         ref_num=ref_num)).fetch(as_dict=True)
-        if not rows:
-            return None
-        return np.squeeze(np.asarray(rows[0]['ref_image'])).astype(np.float32)
 
     alignments = get_2p_alignments(subject_name)
     if not alignments.empty:
@@ -943,14 +981,14 @@ def _imaging_reference_tab(schema, WfieldParameters, WfieldStack):
     sel_tp_lbl = col_tp.selectbox('TwoPhoton dataset', tp_labels, key='ir_tp_sel')
     tp_row = tp_sessions[tp_labels.index(sel_tp_lbl)]
 
-    @st.cache_data
+    @cache
     def get_dataset_files(subject_name, session_name):
         rows = (schema.Dataset.DataFiles
                 & dict(subject_name=subject_name, session_name=session_name)
                 ).fetch('dataset_name', 'file_path', as_dict=True)
         return [(r['dataset_name'], r['file_path']) for r in rows]
 
-    @st.cache_data
+    @cache
     def load_datafile_raw(file_path):
         """Load without collapsing channels — returns squeezed array of any ndim."""
         local = (schema.File & dict(file_path=file_path)).get()[0]
@@ -968,7 +1006,7 @@ def _imaging_reference_tab(schema, WfieldParameters, WfieldStack):
             arr = np.array(PILImage.open(local).convert('L'))
         return np.squeeze(arr).astype(np.float32)
 
-    @st.cache_data
+    @cache
     def get_saved_alignment(subject_name, ref_num, session_name, dataset_name):
         rows = (TwoPhotonReferenceAlignment & dict(
             subject_name=subject_name, ref_num=ref_num,
@@ -976,7 +1014,7 @@ def _imaging_reference_tab(schema, WfieldParameters, WfieldStack):
         )).fetch(as_dict=True)
         return rows[0] if rows else None
 
-    @st.cache_data
+    @cache
     def get_cell_seg_entries(subject_name, session_name, dataset_name):
         try:
             from labdata.schema import CellSegmentation, CellSegmentationParams
@@ -997,7 +1035,7 @@ def _imaging_reference_tab(schema, WfieldParameters, WfieldStack):
         except Exception:
             return []
 
-    @st.cache_data
+    @cache
     def get_cell_seg_proj_list(subject_name, session_name, dataset_name, parameter_set_num):
         try:
             from labdata.schema import CellSegmentation
@@ -1008,7 +1046,7 @@ def _imaging_reference_tab(schema, WfieldParameters, WfieldStack):
         except Exception:
             return []
 
-    @st.cache_data
+    @cache
     def load_cell_seg_proj(subject_name, session_name, dataset_name,
                            parameter_set_num, plane_num, proj_name):
         from labdata.schema import CellSegmentation
@@ -1316,7 +1354,7 @@ def _imaging_reference_tab(schema, WfieldParameters, WfieldStack):
             st.error(str(exc))
 
 
-# ── Atlas alignment helpers ──────────────────────────────────────────────────
+# Atlas alignment helpers
 
 def _render_atlas_overlay(mean_proj, ccf_regions_dict, reference_point,
                           resolution, rotation=0., scale=1., ratio=1.,
@@ -1433,7 +1471,7 @@ def _extract_click(event):
     return None
 
 
-# ── Atlas alignment tab ──────────────────────────────────────────────────────
+# Atlas alignment tab 
 
 @st.fragment
 def _atlas_alignment_tab(schema, WfieldParameters, WfieldStack):
@@ -1447,29 +1485,28 @@ def _atlas_alignment_tab(schema, WfieldParameters, WfieldStack):
     subject_name = sel_key['subject_name']
     session_name = sel_key['session_name']
     dataset_name = sel_key['dataset_name']
-    widefield_key = dict(subject_name=subject_name,
-                         session_name=session_name,
-                         dataset_name=dataset_name)
+    cache = _tab_cache_factory('refresh_atlas')
+    _refresh_button('refresh_atlas')
 
-    @st.cache_data
+    @cache
     def get_atlases():
         return list((WidefieldAtlas()).fetch('atlas_name'))
 
-    @st.cache_data
+    @cache
     def get_stack_ids_at(subject_name, session_name, dataset_name):
         return list((WfieldStack & dict(subject_name=subject_name,
                                         session_name=session_name,
                                         dataset_name=dataset_name)
                      ).fetch('wfield_analysis_id'))
 
-    @st.cache_data
+    @cache
     def get_mean_proj_at(subject_name, session_name, dataset_name, analysis_id):
         key = dict(subject_name=subject_name, session_name=session_name,
                    dataset_name=dataset_name, wfield_analysis_id=analysis_id)
         mp = np.squeeze((WfieldStack & key).fetch1('mean_proj'))
         return (mp[0] if mp.ndim == 3 else mp).astype(np.float32)
 
-    @st.cache_data
+    @cache
     def get_response_projections(subject_name, session_name, dataset_name):
         key = dict(subject_name=subject_name, session_name=session_name,
                    dataset_name=dataset_name)
@@ -1477,7 +1514,7 @@ def _atlas_alignment_tab(schema, WfieldParameters, WfieldStack):
             'stim_name', 'proj_name', as_dict=True)
         return [(r['stim_name'], r['proj_name']) for r in rows]
 
-    @st.cache_data
+    @cache
     def get_response_proj_image(subject_name, session_name, dataset_name,
                                 response_name, proj_name):
         key = dict(subject_name=subject_name, session_name=session_name,
@@ -1486,16 +1523,24 @@ def _atlas_alignment_tab(schema, WfieldParameters, WfieldStack):
         arr = np.squeeze(np.asarray((WidefieldResponse.Projection & key).fetch1('proj')))
         return arr  # preserve original dtype (uint8 RGB or float)
 
-    @st.cache_data
+    @cache
     def get_atlas_row(atlas_name):
         return (WidefieldAtlas & dict(atlas_name=atlas_name)).fetch1()
 
-    @st.cache_data
+    @cache
     def get_existing_transforms(subject_name, session_name, dataset_name, atlas_name):
         return (WidefieldAtlasTransform & dict(
             subject_name=subject_name, session_name=session_name,
             dataset_name=dataset_name, atlas_name=atlas_name,
         )).fetch(as_dict=True)
+
+    @cache
+    def get_imaging_window(subject_name, session_name, dataset_name):
+        from .pluginschema import ImagingWindow
+        rows = (ImagingWindow & dict(subject_name=subject_name,
+                                     session_name=session_name,
+                                     dataset_name=dataset_name)).fetch(as_dict=True)
+        return rows[0] if rows else None
 
     atlas_names = get_atlases()
     if not atlas_names:
@@ -1533,14 +1578,6 @@ def _atlas_alignment_tab(schema, WfieldParameters, WfieldStack):
     sel_img = st.selectbox('Reference image', img_options, key='at_ref_img',
                             help='Use a WidefieldResponse projection (e.g. retinotopy phase map) '
                                  'as the background for atlas alignment.')
-
-    @st.cache_data
-    def get_imaging_window(subject_name, session_name, dataset_name):
-        from .pluginschema import ImagingWindow
-        rows = (ImagingWindow & dict(subject_name=subject_name,
-                                     session_name=session_name,
-                                     dataset_name=dataset_name)).fetch(as_dict=True)
-        return rows[0] if rows else None
 
     with st.spinner('Loading…'):
         if sel_img == _DEFAULT_IMG:
@@ -1810,3 +1847,234 @@ def _atlas_landmarks_subtab(sel_key, atlas_name, transform_id,
 
     except Exception as exc:
         st.error(f'Transform preview failed: {exc}')
+
+
+# Cell atlas tab
+
+@st.fragment
+def _cell_atlas_tab(schema):
+    """Populate CellSegmentationAtlas and scatter ROI atlas positions across
+    one or more sessions / subjects on the atlas contours."""
+    from .pluginschema import CellSegmentationAtlas, WidefieldAtlas
+
+    st.subheader('CellSegmentation Atlas')
+    cache = _tab_cache_factory('refresh_cellatlas')
+    _refresh_button('refresh_cellatlas')
+
+    PK = ['subject_name', 'session_name', 'dataset_name', 'parameter_set_num',
+          'ref_num', 'ref_session', 'ref_dataset', 'atlas_name', 'atlas_transform_id']
+
+    @cache
+    def get_pending_count():
+        return len(CellSegmentationAtlas().key_source - CellSegmentationAtlas())
+
+    @cache
+    def get_populated_masters():
+        rows = CellSegmentationAtlas().fetch(*PK, 'n_rois', 'n_in_atlas', as_dict=True)
+        return pd.DataFrame(rows)
+
+    @cache
+    def get_rois(keys_tuple):
+        keys = [dict(zip(PK, vals)) for vals in keys_tuple]
+        rows = (CellSegmentationAtlas.ROI & keys).fetch(
+            'subject_name', 'session_name', 'dataset_name', 'parameter_set_num',
+            'plane_num', 'roi_num', 'atlas_x', 'atlas_y',
+            'acronym', 'hemisphere', as_dict=True)
+        return pd.DataFrame(rows)
+
+    # CellSegmentation key columns shared with the Selection part table
+    SEG_COLS = ['subject_name', 'session_name', 'dataset_name', 'parameter_set_num']
+    ROI_COLS = SEG_COLS + ['plane_num', 'roi_num']
+
+    @cache
+    def get_selection_methods(seg_keys_tuple):
+        try:
+            from labdata.schema import CellSegmentation
+            keys = [dict(zip(SEG_COLS, v)) for v in seg_keys_tuple]
+            return sorted(set((CellSegmentation.Selection & keys).fetch('selection_method')))
+        except Exception:
+            return []
+
+    @cache
+    def get_selected_rois(seg_keys_tuple, method):
+        from labdata.schema import CellSegmentation
+        keys = [dict(zip(SEG_COLS, v)) for v in seg_keys_tuple]
+        rows = (CellSegmentation.Selection & keys
+                & f'selection_method="{method}"' & 'selection=1').fetch(*ROI_COLS, as_dict=True)
+        return pd.DataFrame(rows, columns=ROI_COLS)
+
+    # Populate
+    try:
+        pending = get_pending_count()
+    except Exception as exc:
+        st.error(f'Could not query key_source: {exc}')
+        pending = 0
+    masters = get_populated_masters()
+
+    pc1, pc2 = st.columns([3, 1])
+    pc1.caption(f'{len(masters)} populated · {pending} pending')
+    if pc2.button('Populate', disabled=(pending == 0), key='ca_populate'):
+        with st.spinner('Populating CellSegmentationAtlas…'):
+            try:
+                CellSegmentationAtlas.populate(display_progress=False)
+                get_pending_count.clear()
+                get_populated_masters.clear()
+                get_rois.clear()
+                st.success('Done.')
+                st.rerun(scope='fragment')
+            except Exception as exc:
+                st.error(str(exc))
+
+    if masters.empty:
+        st.info('No CellSegmentationAtlas entries yet — populate above.')
+        return
+
+    # Selection
+    subjects = sorted(masters['subject_name'].unique())
+    # Default to a single animal on first load (user can add more).
+    sel_subjects = st.multiselect('Subjects', subjects, default=subjects[:1], key='ca_subjects')
+    sub_df = masters[masters['subject_name'].isin(sel_subjects)].reset_index(drop=True)
+    if sub_df.empty:
+        st.info('Select at least one subject.')
+        return
+
+    def _lbl(r):
+        return (f"{r['subject_name']} / {r['session_name']} / {r['dataset_name']} "
+                f"(p{r['parameter_set_num']}, ref{r['ref_num']}, "
+                f"{r['atlas_name']}#{r['atlas_transform_id']}) "
+                f"— {int(r['n_rois'])} ROIs")
+    labels = [_lbl(r) for _, r in sub_df.iterrows()]
+    sel_labels = st.multiselect('Sessions', labels, default=labels, key='ca_sessions')
+    if not sel_labels:
+        st.info('Select at least one session.')
+        return
+    sel_rows = sub_df.iloc[[labels.index(l) for l in sel_labels]]
+    seg_keys_tuple = tuple(map(tuple, sel_rows[SEG_COLS].drop_duplicates().values))
+
+    # Options
+    sel_methods = get_selection_methods(seg_keys_tuple)
+    o1, o2, o3 = st.columns(3)
+    color_by    = o1.selectbox('Color by', ['session', 'subject', 'region'], key='ca_colorby')
+    sel_method  = o2.selectbox('Selection', ['(all ROIs)'] + sel_methods, key='ca_selmethod',
+                               help='Keep only ROIs marked as cells (selection=1) by this '
+                                    'CellSegmentation.Selection method')
+    only_region = o3.checkbox('Only ROIs in a region', value=False, key='ca_onlyreg')
+    o4, o5 = st.columns(2)
+    psize       = o4.slider('Point size', 1, 40, 3, key='ca_psize')
+    palpha      = o5.slider('Point alpha', 0.05, 1.0, 0.4, step=0.05, key='ca_palpha')
+
+    keys_tuple = tuple(tuple(r[c] for c in PK) for _, r in sel_rows.iterrows())
+    with st.spinner('Loading ROIs…'):
+        df = get_rois(keys_tuple)
+    if df.empty:
+        st.warning('No ROIs found for the selected sessions.')
+        return
+    if sel_method != '(all ROIs)':
+        sel_df = get_selected_rois(seg_keys_tuple, sel_method)
+        if sel_df.empty:
+            st.warning(f'No ROIs selected by method "{sel_method}" in the selection.')
+            return
+        df = df.merge(sel_df, on=ROI_COLS, how='inner')
+        if df.empty:
+            st.warning(f'No atlas-placed ROIs selected by method "{sel_method}".')
+            return
+    if only_region:
+        df = df[df['acronym'].notna()]
+        if df.empty:
+            st.warning('No ROIs assigned to a region in the selection.')
+            return
+
+    if color_by == 'subject':
+        df['grp'] = df['subject_name']
+    elif color_by == 'session':
+        df['grp'] = df['subject_name'] + ' / ' + df['session_name']
+    else:
+        df['grp'] = df['acronym'].fillna('(none)')
+    groups = sorted(df['grp'].unique())
+
+    # Figure
+    import plotly.graph_objects as go
+    import plotly.express as px
+
+    atlas_names = sel_rows['atlas_name'].unique()
+    if len(atlas_names) > 1:
+        st.warning(f'Multiple atlases selected ({", ".join(atlas_names)}); '
+                   f'drawing contours from "{atlas_names[0]}".')
+
+    fig = go.Figure()
+    try:
+        regions = pd.DataFrame(
+            (WidefieldAtlas & dict(atlas_name=atlas_names[0])).fetch1('ccf_regions'))
+
+        # Decide which hemispheres to draw by assigning each cell to the nearer
+        # hemisphere using the region centers (robust to the ML sign convention).
+        def _centers_xy(col):
+            c = np.array([np.asarray(v, float).ravel()[:2] for v in regions[col]], float)
+            return c[np.all(np.isfinite(c), axis=1)]
+        left_c, right_c = _centers_xy('left_center'), _centers_xy('right_center')
+        cells = df[['atlas_x', 'atlas_y']].to_numpy(float)
+
+        def _min_dist(pts, centers):  # nearest-center distance per point
+            return np.sqrt(((pts[:, None, :] - centers[None, :, :]) ** 2).sum(-1)).min(axis=1)
+
+        if len(left_c) and len(right_c) and len(cells):
+            to_left = _min_dist(cells, left_c) <= _min_dist(cells, right_c)
+            sides = [s for s, present in (('left', bool(to_left.any())),
+                                          ('right', bool((~to_left).any()))) if present]
+        else:
+            sides = ['left', 'right']
+
+        lbl_x, lbl_y, lbl_t = [], [], []
+        for _, reg in regions.iterrows():
+            for side in sides:
+                xs = np.asarray(reg[f'{side}_x'], dtype=float)
+                ys = np.asarray(reg[f'{side}_y'], dtype=float)
+                if len(xs) > 1:
+                    fig.add_trace(go.Scatter(
+                        x=xs, y=ys, mode='lines',
+                        line=dict(color='black', width=1),
+                        hoverinfo='skip', showlegend=False))
+                    c = np.asarray(reg[f'{side}_center'], dtype=float).ravel()
+                    if c.size >= 2 and np.all(np.isfinite(c)):
+                        lbl_x.append(float(c[0])); lbl_y.append(float(c[1]))
+                        lbl_t.append(str(reg['acronym']))
+        if lbl_x:
+            fig.add_trace(go.Scatter(
+                x=lbl_x, y=lbl_y, mode='text', text=lbl_t,
+                textfont=dict(color='black', size=9),
+                hoverinfo='skip', showlegend=False))
+    except Exception:
+        pass
+
+    palette = px.colors.qualitative.Dark24
+    for i, g in enumerate(groups):
+        s = df[df['grp'] == g]
+        fig.add_trace(go.Scattergl(
+            x=s['atlas_x'], y=s['atlas_y'], mode='markers',
+            name=f'{g} ({len(s)})',
+            marker=dict(size=psize, opacity=palpha,
+                        color=palette[i % len(palette)]),
+            customdata=s['acronym'].fillna('(none)'),
+            hovertemplate='ML %{x:.2f} mm<br>AP %{y:.2f} mm<br>%{customdata}<extra></extra>'))
+
+    # Orientation: imaged hemisphere on the left of the screen, anterior (-AP) at the top
+    axis_style = dict(
+        title_font=dict(color='black'), tickfont=dict(color='black'),
+        ticks='outside', ticklen=6, tickwidth=1, tickcolor='black',
+        showline=True, linecolor='black', linewidth=1,
+        showgrid=False, zeroline=False,
+    )
+    fig.update_xaxes(title='ML (mm from bregma)', **axis_style)
+    fig.update_yaxes(title='AP (mm from bregma)', autorange='reversed',
+                     scaleanchor='x', scaleratio=1, **axis_style)
+    fig.update_layout(height=650, title=f'{len(df)} ROIs · {len(sel_rows)} session(s)',
+                      legend=dict(font=dict(size=10)), plot_bgcolor='white',
+                      margin=dict(l=10, r=10, t=40, b=10))
+    st.plotly_chart(fig, width='stretch')
+
+    # Region summary
+    with st.expander('ROIs per region'):
+        summary = (df.assign(acronym=df['acronym'].fillna('(none)'))
+                     .groupby('acronym').size()
+                     .reset_index(name='n_rois').sort_values('n_rois', ascending=False))
+        st.dataframe(summary, hide_index=True)

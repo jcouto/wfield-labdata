@@ -5,7 +5,7 @@ userschema = get_user_schema()
 __all__ = ['WfieldParameters', 'WfieldStack', 'ImagingWindow',
            'ImagingReference','TwoPhotonReferenceAlignment',
            'WidefieldAtlas', 'WidefieldAtlasTransform',
-           'WidefieldResponse']
+           'WidefieldResponse', 'CellSegmentationAtlas']
 
 userschema = get_user_schema()
 
@@ -327,7 +327,7 @@ class ImagingReference(dj.Manual):
                             lo_p, hi_p = np.percentile(warped[fov_mask], [2, 98])
                             proj_norm = np.clip(
                                 (warped - lo_p) / max(hi_p - lo_p, 1e-9), 0, 1)
-                            rgba = plt.get_cmap('hot')(proj_norm)
+                            rgba = plt.get_cmap('gray')(proj_norm)
                             rgba[..., 3] = fov_mask.astype(float) * alpha
                             ax.imshow(rgba, origin='upper', aspect='equal')
 
@@ -530,7 +530,7 @@ class WidefieldAtlasTransform(dj.Manual):
     definition = '''
     -> Widefield
     -> WidefieldAtlas
-    atlas_transform_id : int           # unique transform per widefield × atlas pair
+    atlas_transform_id : int           # unique transform per widefield-atlas pair
     ---
     transform_type               : enum('landmarks','manual')
     reference_point = NULL       : blob       # [col, row] of bregma in the widefield image (pixels)
@@ -716,3 +716,126 @@ class WidefieldResponse(dj.Manual):
             key = self.fetch1('KEY')
         filepath = (AnalysisFile & (self & key)).get()[0]
         return np.load(filepath)
+
+
+def _find_point_region(point, region_contours):
+    '''Return ``(acronym, hemisphere, distance)`` for the first region polygon
+    that contains ``point`` (x, y in atlas mm), else ``(None, None, None)``.
+
+    ``distance`` is the cv2 signed distance to the contour edge (mm, + inside).
+    Mirrors ``wfield``'s ``find_point_region``.
+    '''
+    import cv2
+    pt = (float(point[0]), float(point[1]))
+    for acronym, side, contour in region_contours:
+        d = cv2.pointPolygonTest(contour, pt, True)
+        if d > 0:
+            return acronym, side, float(d)
+    return None, None, None
+
+
+@userschema
+class CellSegmentationAtlas(dj.Computed):
+    '''Atlas position and region assignment for every segmented ROI.
+
+    Combines a CellSegmentation result with a TwoPhotonReferenceAlignment
+    (2P -> widefield reference image) and a WidefieldAtlasTransform
+    (atlas mm <-> widefield pixels) to place each ROI in Allen CCF
+    coordinates (mm from bregma) and assign it to a cortical region.
+
+    The WidefieldAtlasTransform's widefield session columns are renamed to
+    ``ref_session`` / ``ref_dataset`` so they don't collide with the 2P
+    session columns; ``key_source`` constrains them to the widefield that the
+    alignment's ImagingReference points at.
+    '''
+    definition = '''
+    -> CellSegmentation
+    -> TwoPhotonReferenceAlignment
+    -> WidefieldAtlasTransform.proj(ref_session='session_name', ref_dataset='dataset_name')
+    ---
+    n_rois        : int            # total ROIs placed
+    n_in_atlas    : int            # ROIs assigned to a region
+    '''
+
+    class ROI(dj.Part):
+        definition = '''
+        -> master
+        -> CellSegmentation.ROI
+        ---
+        atlas_x              : float                  # ML position, mm from bregma (+ = right)
+        atlas_y              : float                  # AP position, mm from bregma (+ = posterior)
+        hemisphere = NULL    : enum('left','right')   # side of the matched region
+        acronym = NULL       : varchar(32)            # Allen region acronym (NULL if outside all regions)
+        region_distance = NULL : float                # signed distance to region edge, mm (+ inside)
+        '''
+
+    @property
+    def key_source(self):
+        # Only combinations where the atlas transform belongs to the widefield
+        # that this alignment's ImagingReference references. Project to the
+        # primary key so downstream joins/antijoins don't trip over shared
+        # secondary attributes (e.g. CellSegmentation.n_rois).
+        align = TwoPhotonReferenceAlignment * ImagingReference.proj('ref_session', 'ref_dataset')
+        atlas = WidefieldAtlasTransform.proj(ref_session='session_name',
+                                             ref_dataset='dataset_name')
+        return (CellSegmentation * align * atlas).proj()
+
+    def make(self, key):
+        import pandas as pd
+        from labdata.schema import CellSegmentation
+        from .utils import transform_coordinates
+
+        # alignment (2P col,row -> widefield reference px) and its optional FOV crop offset
+        align = TwoPhotonReferenceAlignment & key
+        fov = align.fetch1('fov_offset')
+        row_off, col_off = (int(fov[0]), int(fov[1])) if fov is not None else (0, 0)
+
+        # atlas transform (atlas mm -> widefield px); invert for widefield px -> mm.
+        # ref_session/ref_dataset are the widefield session the transform aligns.
+        atlas_xf = WidefieldAtlasTransform & dict(
+            subject_name=key['subject_name'],
+            session_name=key['ref_session'], dataset_name=key['ref_dataset'],
+            atlas_name=key['atlas_name'], atlas_transform_id=key['atlas_transform_id'])
+        M_atlas_inv = np.linalg.inv(atlas_xf.get_transform())
+
+        # region contours in atlas mm, left & right hemispheres
+        regions = pd.DataFrame((WidefieldAtlas & key).fetch1('ccf_regions'))
+        region_contours = []
+        for _, reg in regions.iterrows():
+            for side in ('left', 'right'):
+                xy = np.column_stack([reg[f'{side}_x'], reg[f'{side}_y']]).astype(np.float32)
+                if len(xy) >= 3:
+                    region_contours.append((reg['acronym'], side, xy))
+
+        # place each ROI centroid: seg (col,row) -> reference px -> atlas mm -> region
+        roi_entries, n_in_atlas = [], 0
+        for plane in (CellSegmentation.Plane & key).fetch('plane_num', 'dims', as_dict=True):
+            if plane['dims'] is None:
+                continue
+            fh, fw = int(plane['dims'][0]), int(plane['dims'][1])
+            M_fwd, transpose, _ = align.get_transform(fw + col_off, fh + row_off)
+            rois = (CellSegmentation.ROI & dict(key, plane_num=plane['plane_num'])).fetch(
+                'roi_num', 'roi_pixels', 'roi_pixels_values', as_dict=True)
+            for roi in rois:
+                pix = np.asarray(roi['roi_pixels']).ravel()
+                if not len(pix):
+                    continue
+                rr, cc = np.unravel_index(pix, (fh, fw))
+                w = roi['roi_pixels_values']
+                w = (np.asarray(w, float).ravel()
+                     if w is not None and len(np.asarray(w).ravel()) == len(pix) else None)
+                cen_col, cen_row = np.average(cc, weights=w), np.average(rr, weights=w)
+                # add FOV offset, swap axes if the alignment transposed the image
+                pt2p = ([cen_row + row_off, cen_col + col_off] if transpose
+                        else [cen_col + col_off, cen_row + row_off])
+                x_mm, y_mm = transform_coordinates(
+                    transform_coordinates(pt2p, M_fwd), M_atlas_inv)[0]
+                acronym, hemi, dist = _find_point_region((x_mm, y_mm), region_contours)
+                n_in_atlas += acronym is not None
+                roi_entries.append(dict(
+                    key, plane_num=plane['plane_num'], roi_num=roi['roi_num'],
+                    atlas_x=float(x_mm), atlas_y=float(y_mm),
+                    hemisphere=hemi, acronym=acronym, region_distance=dist))
+
+        self.insert1(dict(key, n_rois=len(roi_entries), n_in_atlas=int(n_in_atlas)))
+        self.ROI.insert(roi_entries)
