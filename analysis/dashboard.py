@@ -1556,8 +1556,10 @@ def _atlas_alignment_tab(schema, WfieldParameters, WfieldStack):
     analysis_id  = hc2.selectbox('WfieldStack', stack_ids if stack_ids else ['—'],
                                   disabled=not stack_ids, key='at_aid')
     existing     = get_existing_transforms(subject_name, session_name, dataset_name, atlas_name)
-    next_id      = 0 if not existing else max(r['atlas_transform_id'] for r in existing) + 1
-    transform_id = int(hc3.number_input('atlas_transform_id', value=next_id,
+    # Default to the latest saved transform so its parameters load on open;
+    # bump the number to create a new one.
+    default_id   = max((r['atlas_transform_id'] for r in existing), default=0) if existing else 0
+    transform_id = int(hc3.number_input('atlas_transform_id', value=default_id,
                                          step=1, min_value=0, key='at_tid'))
     if existing:
         disp_cols = [k for k in existing[0]
@@ -1608,7 +1610,8 @@ def _atlas_manual_subtab(sel_key, atlas_name, transform_id,
     session_name = sel_key['session_name']
     dataset_name = sel_key['dataset_name']
     img_h, img_w = mean_proj.shape[:2]
-    scope = f'{subject_name}|{session_name}|{dataset_name}|{atlas_name}'
+    # transform_id is part of the scope so picking a saved transform reloads its parameters
+    scope = f'{subject_name}|{session_name}|{dataset_name}|{atlas_name}|{transform_id}'
 
     # Drain pending bregma click into slider state before widgets render
     for k in ('rx', 'ry'):
@@ -1703,15 +1706,32 @@ def _atlas_landmarks_subtab(sel_key, atlas_name, transform_id,
     atlas_res    = float(atlas_row['resolution'])          # mm / atlas pixel
     ref_row_a, ref_col_a = atlas_row['reference_point']   # [row, col]
     atlas_h, atlas_w = proj.shape
-    scope = f'{subject_name}|{session_name}|{dataset_name}|{atlas_name}'
+    scope = f'{subject_name}|{session_name}|{dataset_name}|{atlas_name}|{transform_id}'
 
     wf_key   = f'at_l_{scope}_wf'
     at_key   = f'at_l_{scope}_at'
     wf_last  = f'at_l_{scope}_wf_last'
     at_last  = f'at_l_{scope}_at_last'
-    for k in (wf_key, at_key):
-        if k not in st.session_state:
-            st.session_state[k] = []
+
+    # On first load of this transform, pre-populate points from a saved landmark transform.
+    if f'{at_key}_init' not in st.session_state:
+        st.session_state[f'{at_key}_init'] = True
+        saved = next((r for r in get_existing_transforms(
+                          subject_name, session_name, dataset_name, atlas_name)
+                      if r['atlas_transform_id'] == transform_id
+                      and r['transform_type'] == 'landmarks'), None)
+        wf_init, at_init = [], []
+        if saved and saved.get('landmarks') is not None \
+                and saved.get('landmarks_match') is not None:
+            lm  = pd.DataFrame(saved['landmarks'])        # atlas-space, mm from bregma (x, y)
+            lmm = pd.DataFrame(saved['landmarks_match'])  # widefield pixels (x=col, y=row)
+            at_init = [[float(x) / atlas_res + ref_col_a, float(y) / atlas_res + ref_row_a]
+                       for x, y in zip(lm['x'], lm['y'])]
+            wf_init = [[float(x), float(y)] for x, y in zip(lmm['x'], lmm['y'])]
+        st.session_state[wf_key] = wf_init
+        st.session_state[at_key] = at_init
+    st.session_state.setdefault(wf_key, [])
+    st.session_state.setdefault(at_key, [])
 
     wf_pts    = st.session_state[wf_key]    # [[col, row], …] in widefield pixels
     atlas_pts = st.session_state[at_key]    # [[col, row], …] in atlas pixels
