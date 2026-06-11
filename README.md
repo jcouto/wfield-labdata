@@ -2,6 +2,8 @@
 
 [``labdata``](https://github.com/jcouto/labdata) plugin for widefield calcium imaging analysis
 
+Look at the documentation for labdata [here](https://jcouto.github.io/labdata-docs)
+
 **Analysis pipeline:** `WfieldParameters`, `WfieldStack`
 
 **Atlas registration:** `WidefieldAtlas`, `WidefieldAtlasTransform`
@@ -425,3 +427,11 @@ Deleting an entry also removes its movie from `AnalysisFile` and S3. Pass `keep_
 | `proj` | 2D ndarray (any dtype — uint8 RGB images are supported) |
 
 `WidefieldResponse` projections are also available as background images in the dashboard **Atlas Alignment** tab, making it straightforward to overlay atlas regions on retinotopy or other functional maps.
+
+---
+
+## License
+
+This project is licensed under the GNU General Public License v3.0 — see the [LICENSE](LICENSE) file for details.
+
+Joao Couto 2026
