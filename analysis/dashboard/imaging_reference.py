@@ -381,12 +381,14 @@ def _imaging_reference_tab(schema, WfieldParameters, WfieldStack):
     rh, rw  = ref_img.shape
 
     # Load existing alignment when the scope changes
-    # For CellSegmentation source, include the selected CS entry so switching entries
-    # also triggers a reload (alignment is per session/dataset but this ensures the
-    # DB is always re-read when the user picks a new CS entry).
+    # For CellSegmentation source, include the selected CS entry, plane and projection
+    # so changing any of them reloads the saved alignment parameters into the GUI
+    # (alignment is per session/dataset; this just re-reads the DB on each selection).
     if src_type == 'CellSegmentation projection':
         align_scope = (f'{sel_ref_num}|cs|{tp_row["session_name"]}|{tp_row["dataset_name"]}'
-                       f'|{st.session_state.get("ir_cs_entry", "")}')
+                       f'|{st.session_state.get("ir_cs_entry", "")}'
+                       f'|{st.session_state.get("ir_cs_plane", "")}'
+                       f'|{st.session_state.get("ir_cs_proj", "")}')
     else:
         align_scope = f'{sel_ref_num}|{tp_row["session_name"]}|{tp_row["dataset_name"]}'
     if st.session_state.get('ir_align_scope') != align_scope:
