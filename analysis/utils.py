@@ -11,7 +11,7 @@ __all__ = [
 
 
 def build_alignment_transform(fw, fh, rotation, scale, ratio, origin_x, origin_y):
-    """Build a 3×3 forward affine matrix mapping 2P (col,row) → reference (col,row).
+    """Build a 3x3 forward affine matrix mapping 2P (col,row) → reference (col,row).
 
     Parameters
     ----------
@@ -115,7 +115,7 @@ def inverse_transform_coordinates(xy, M_fwd):
 
 def build_atlas_transform(bregma_xy, resolution, rotation=0.0, scale=1.0, ratio=1.0,
                           mirror=False):
-    """Build a 3×3 forward matrix mapping atlas mm coordinates to widefield pixel coordinates.
+    """Build a 3x3 forward matrix mapping atlas mm coordinates to widefield pixel coordinates.
 
     Atlas regions are expressed in mm relative to bregma (bregma = origin).
     The resulting matrix places bregma at ``bregma_xy`` in the widefield image.
@@ -180,5 +180,3 @@ def transform_atlas_regions(ccf_regions, M_fwd):
             center_px = transform_coordinates(center, M_fwd)
             result.at[i, f'{side}_center'] = center_px[0].tolist()
     return result
-
-

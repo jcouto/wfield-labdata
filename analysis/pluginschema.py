@@ -197,6 +197,66 @@ class ImagingWindow(dj.Manual):
     circle_parameters = NULL     : blob          # circle parameters for the window
     """
 
+    def apply_window_mask(self, image=None):
+        """Set everything outside the imaging-window circle to NaN.
+
+        Builds the circular mask from this window's `circle_parameters`
+        ([col, row, radius] in widefield pixels) and fills the area outside the
+        circle with NaN. The spatial (H, W) axes are auto-detected:
+
+        - ``H x W``                  — a single image
+        - ``H x W x C`` (C in {3,4}) — a colour image (mask broadcast over channels)
+        - ``N x H x W``              — a movie / channel-first stack (masked per frame)
+        - ``... x H x W``            — higher-dim arrays (last two axes are spatial)
+
+        Parameters
+        ----------
+        image : ndarray, optional
+            Image or movie to mask, in this window's pixel space. When omitted,
+            the mean projection of this session's WfieldStack (lowest
+            `wfield_analysis_id`) is used.
+
+        Returns
+        -------
+        masked : ndarray (float)
+            A copy of the input with pixels outside the window set to NaN.
+        """
+        win = self.fetch1()
+        cp = win.get('circle_parameters')
+        if cp is None:
+            raise ValueError('This ImagingWindow has no circle_parameters.')
+        xc, yc, radius = np.asarray(cp, dtype=float).ravel()[:3]
+
+        if image is None:
+            key = dict(subject_name=win['subject_name'],
+                       session_name=win['session_name'],
+                       dataset_name=win['dataset_name'])
+            aids = (WfieldStack & key).fetch('wfield_analysis_id')
+            if not len(aids):
+                raise ValueError('No image passed and no WfieldStack mean projection '
+                                 'available for this session — pass an image explicitly.')
+            mp = (WfieldStack & dict(key, wfield_analysis_id=int(min(aids)))).fetch1('mean_proj')
+            mp = np.squeeze(np.asarray(mp)).astype(float)
+            image = mp[0] if mp.ndim == 3 else mp   # mean_proj is channel-first
+        image = np.asarray(image, dtype=float)
+
+        def _circle(h, w):
+            rr, cc = np.ogrid[:h, :w]
+            return (cc - xc) ** 2 + (rr - yc) ** 2 <= radius ** 2
+
+        masked = image.copy()
+        nd = image.ndim
+        if nd == 2:                                    # H x W
+            masked[~_circle(*image.shape)] = np.nan
+        elif nd == 3 and image.shape[-1] in (3, 4):    # H x W x C (colour)
+            masked[~_circle(*image.shape[:2])] = np.nan
+        elif nd == 3:                                  # N x H x W (movie / channel-first)
+            masked[:, ~_circle(*image.shape[1:])] = np.nan
+        else:                                          # ... x H x W
+            masked[..., ~_circle(*image.shape[-2:])] = np.nan
+        return masked
+
+
 @userschema
 class ImagingReference(dj.Manual):
     definition = """
@@ -393,6 +453,60 @@ class TwoPhotonReferenceAlignment(dj.Manual):
             fov_offset = np.asarray(fov_offset).ravel()
         return M_fwd, transpose, fov_offset
 
+    def apply_transform(self, image, output_shape=None):
+        """Warp a 2P image into the reference-image pixel space using this alignment.
+
+        Applies the stored FOV offset (padding), transpose, and affine transform
+        so the result lands in the ImagingReference image coordinates. Pixels
+        outside the warped 2P field of view are 0.
+
+        Parameters
+        ----------
+        image : ndarray
+            2P image (H x W) or movie (N x H x W) in the 2P / segmentation pixel
+            space (i.e. the cropped FOV the alignment was defined against).
+        output_shape : (H, W), optional
+            Shape of the reference space. Defaults to this alignment's
+            ImagingReference image shape.
+
+        Returns
+        -------
+        warped : ndarray (float)
+            The image in reference-image coordinates; an (N, H, W) movie warps
+            frame by frame.
+        """
+        from .utils import warp_image
+        row = self.fetch1()
+        fov = row.get('fov_offset')
+        row_off, col_off = (int(fov[0]), int(fov[1])) if fov is not None else (0, 0)
+
+        if output_shape is None:
+            ref_img = (ImagingReference & self).fetch1('ref_image')
+            output_shape = np.squeeze(np.asarray(ref_img)).shape[:2]
+        rh, rw = int(output_shape[0]), int(output_shape[1])
+
+        image = np.asarray(image, dtype=float)
+        if image.ndim not in (2, 3):
+            raise ValueError('image must be 2-D (H x W) or 3-D (N x H x W).')
+        is_movie = image.ndim == 3
+        frames = image if is_movie else image[None]
+
+        fh_img, fw_img = frames.shape[1:]
+        fh_raw, fw_raw = fh_img + row_off, fw_img + col_off
+        M_fwd, transpose, _ = self.get_transform(fw_raw, fh_raw)
+
+        out = []
+        for frame in frames:
+            if row_off or col_off:
+                padded = np.zeros((fh_raw, fw_raw), dtype=float)
+                padded[row_off:row_off + fh_img, col_off:col_off + fw_img] = frame
+                frame = padded
+            if transpose:
+                frame = frame.T
+            out.append(warp_image(frame, M_fwd, (rh, rw)))
+        out = np.stack(out)
+        return out if is_movie else out[0]
+
 
 @userschema
 class WidefieldAtlas(dj.Manual):
@@ -585,7 +699,7 @@ class WidefieldAtlasTransform(dj.Manual):
 
     def load_reference(self):
         """Return (ccf_regions, proj, brain_outline) for this atlas."""
-        return (WidefieldAtlas & self).load()
+        return (WidefieldAtlas & self.proj()).load()
 
     def transform_regions(self, ccf_regions=None):
         """Return ccf_regions DataFrame transformed to widefield pixel coordinates."""
@@ -597,7 +711,7 @@ class WidefieldAtlasTransform(dj.Manual):
             ccf_regions = pd.DataFrame(ccf_regions)
         return transform_atlas_regions(ccf_regions, self.get_transform())
 
-    def plot_regions(self, acronyms=None, ax=None, labels=True, **kwargs):
+    def plot_regions(self, acronyms=None, ax=None, labels=True, sides = ('left', 'right'), **kwargs):
         """Plot transformed atlas region contours.
 
         Parameters
@@ -622,10 +736,12 @@ class WidefieldAtlasTransform(dj.Manual):
             color = kwargs.get('color', [c / 255 for c in rgb] if rgb is not None else None)
             kw = {**kwargs, 'color': color}
             kw.setdefault('lw', 1)
-            ax.plot(row['left_x'],  row['left_y'],  **kw)
-            ax.plot(row['right_x'], row['right_y'], **kw)
+            if 'left' in sides:
+                ax.plot(row['left_x'],  row['left_y'],  **kw)
+            if 'right' in sides:
+                ax.plot(row['right_x'], row['right_y'], **kw)
             if labels:
-                for side in ('left', 'right'):
+                for side in sides:
                     cx, cy = row[f'{side}_center']
                     ax.text(cx, cy, row['acronym'],
                             ha='center', va='center', fontsize=6, color=color)

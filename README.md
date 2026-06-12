@@ -148,6 +148,51 @@ WfieldStack.Projection.insert1(dict(**key, wfield_analysis_id=0,
 
 ---
 
+## Imaging window
+
+`ImagingWindow` stores the cranial-window geometry for a widefield recording: the fitted circle (`circle_parameters` = `[col, row, radius]` in pixels), the points sampled around it, the window size (mm) and resolution (mm/pixel). Create it interactively in the dashboard **Window mask** tab.
+
+**`apply_window_mask(image=None)`** builds the circular mask from `circle_parameters` and returns a `float` copy of the input with everything **outside** the window set to `NaN`. When no image is passed it falls back to the mean projection of the session's `WfieldStack` (lowest `wfield_analysis_id`). The spatial axes are auto-detected, so it accepts a single image, a colour image, or a movie:
+
+- `H x W` — a single image
+- `H x W x C` (`C` is 3 or 4) — a colour image (mask broadcast over channels)
+- `N x H x W` — a movie / channel-first stack (masked per frame)
+- `... x H x W` — higher-dim arrays (the last two axes are spatial)
+
+```python
+win = ImagingWindow & dict(subject_name='subject001',
+                           session_name='2024-01-15', dataset_name='wfield_00')
+
+# Mask the session's own mean projection (no argument needed)
+masked = win.apply_window_mask()
+
+# Mask any image in the window's pixel space
+stack = (WfieldStack & dict(subject_name='subject001',
+                            session_name='2024-01-15', dataset_name='wfield_00',
+                            wfield_analysis_id=0)).open()
+masked_var = win.apply_window_mask(stack.projections['var'])
+
+# Mask a whole movie (N x H x W) — each frame is masked the same way
+masked_movie = win.apply_window_mask(stack[:200])   # shape (200, H, W)
+
+# Pixels outside the window are NaN, so reductions ignore them cleanly
+import numpy as np
+print('mean inside window:', np.nanmean(masked_var))
+trace = np.nanmean(masked_movie, axis=(1, 2))   # per-frame mean over the window
+
+import matplotlib.pyplot as plt
+plt.imshow(masked_var)   # the area outside the window is left blank (NaN)
+```
+
+| Field | Description |
+|---|---|
+| `window_size` | Window diameter in mm |
+| `resolution` | mm per widefield pixel |
+| `points` | Points sampled manually around the window edge |
+| `circle_parameters` | `[col, row, radius]` of the fitted circle, in pixels |
+
+---
+
 ## Atlas registration
 
 ### WidefieldAtlas
@@ -296,6 +341,12 @@ align = (TwoPhotonReferenceAlignment
 
 # Forward affine for a raw 2P image of width fw, height fh:
 M_fwd, transpose, fov_offset = align.get_transform(fw, fh)   # 2P (col,row) → reference px
+
+# Or warp a 2P image (or N x H x W movie) straight into the reference image space.
+# It applies the FOV offset, transpose, and affine; outside the FOV is 0.
+warped = align.apply_transform(twop_mean)                    # -> reference-image shape
+warped_movie = align.apply_transform(twop_movie)             # (N, H, W) warped per frame
+warped = align.apply_transform(twop_mean, output_shape=(512, 512))  # custom output size
 ```
 
 Overlay every aligned 2P dataset's `CellSegmentation` projections back onto a reference image, with a rectangle marking each field of view:

@@ -102,7 +102,9 @@ SCHEMA_REFERENCE = {
     'ImagingWindow': (
         'Manual — cranial-window geometry for a recording: circle parameters, '
         'resolution (mm/px), and the points sampled around the window.',
-        {},
+        {'apply_window_mask(image=None)':
+            'fill outside the window circle with NaN — image, colour image, or N x H x W '
+            'movie (defaults to the session mean projection)'},
         {},
     ),
     'ImagingReference': (
@@ -115,7 +117,9 @@ SCHEMA_REFERENCE = {
     'TwoPhotonReferenceAlignment': (
         'Manual — affine alignment of a TwoPhoton dataset to an ImagingReference '
         '(rotation / scale / ratio / transpose / origin / fov_offset).',
-        {'get_transform(fw, fh)': 'return (M_fwd, transpose, fov_offset): 2P (col,row) → reference px'},
+        {'get_transform(fw, fh)': 'return (M_fwd, transpose, fov_offset): 2P (col,row) → reference px',
+         'apply_transform(image, output_shape=None)':
+            'warp a 2P image or N x H x W movie into the reference image pixel space'},
         {},
     ),
     'WidefieldAtlas': (
