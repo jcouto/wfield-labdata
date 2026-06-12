@@ -176,8 +176,17 @@ def _imaging_reference_tab(schema, WfieldParameters, WfieldStack):
     def get_2p_alignments(subject_name):
         rows = (TwoPhotonReferenceAlignment & dict(subject_name=subject_name)).fetch(
             'ref_num', 'session_name', 'dataset_name',
-            'rotation', 'scale', 'transpose', 'ratio', as_dict=True)
-        return pd.DataFrame(rows) if rows else pd.DataFrame()
+            'rotation', 'scale', 'transpose', 'ratio', 'origin', 'fov_offset', as_dict=True)
+        if not rows:
+            return pd.DataFrame()
+        for r in rows:
+            o = np.asarray(r.pop('origin')).ravel() if r.get('origin') is not None else None
+            r['origin_x'] = float(o[0]) if o is not None else None
+            r['origin_y'] = float(o[1]) if o is not None else None
+            fov = r.pop('fov_offset')
+            fov = np.asarray(fov).ravel() if fov is not None else (0, 0)
+            r['fov_row'], r['fov_col'] = int(fov[0]), int(fov[1])
+        return pd.DataFrame(rows)
 
     @cache
     def get_tp_sessions(subject_name):
@@ -391,31 +400,60 @@ def _imaging_reference_tab(schema, WfieldParameters, WfieldStack):
                        f'|{st.session_state.get("ir_cs_proj", "")}')
     else:
         align_scope = f'{sel_ref_num}|{tp_row["session_name"]}|{tp_row["dataset_name"]}'
+    def _set_align_state(saved, *, rw, rh):
+        """Push an alignment row (or defaults if None) into the GUI widget state."""
+        if saved:
+            origin = np.asarray(saved['origin']).ravel()
+            fov = (np.asarray(saved['fov_offset']).ravel()
+                   if saved.get('fov_offset') is not None else (0, 0))
+            st.session_state['ir_rot']       = float(saved['rotation'])
+            st.session_state['ir_scale']     = float(saved['scale'])
+            st.session_state['ir_ratio']     = float(saved['ratio'])
+            st.session_state['ir_transpose'] = bool(saved['transpose'])
+            st.session_state['ir_ox_slider'] = int(np.clip(origin[0], 0, rw))
+            st.session_state['ir_oy_slider'] = int(np.clip(origin[1], 0, rh))
+            st.session_state['ir_fov_row']   = int(fov[0])
+            st.session_state['ir_fov_col']   = int(fov[1])
+        else:
+            st.session_state['ir_rot']       = 0.0
+            st.session_state['ir_scale']     = 0.1
+            st.session_state['ir_ratio']     = 1.0
+            st.session_state['ir_transpose'] = False
+            st.session_state['ir_ox_slider'] = rw // 2
+            st.session_state['ir_oy_slider'] = rh // 2
+            st.session_state['ir_fov_row']   = 0
+            st.session_state['ir_fov_col']   = 0
+
     if st.session_state.get('ir_align_scope') != align_scope:
         st.session_state['ir_align_scope'] = align_scope
         st.session_state.pop('ir_align_last', None)
         saved = get_saved_alignment(subject_name, sel_ref_num,
                                     tp_row['session_name'], tp_row['dataset_name'])
-        if saved:
-            st.session_state['ir_rot']       = float(saved['rotation'])
-            st.session_state['ir_scale']     = float(saved['scale'])
-            st.session_state['ir_ratio']     = float(saved['ratio'])
-            st.session_state['ir_transpose'] = bool(saved['transpose'])
-            origin = np.asarray(saved['origin']).ravel()
-            st.session_state['ir_ox_slider'] = int(np.clip(origin[0], 0, rw))
-            st.session_state['ir_oy_slider'] = int(np.clip(origin[1], 0, rh))
-            if saved.get('fov_offset') is not None:
-                off = np.asarray(saved['fov_offset']).ravel()
-                st.session_state['ir_fov_row'] = int(off[0])
-                st.session_state['ir_fov_col'] = int(off[1])
-            st.session_state['ir_loaded_align'] = True
-        else:
-            st.session_state['ir_ox_slider']  = rw // 2
-            st.session_state['ir_oy_slider']  = rh // 2
-            st.session_state['ir_loaded_align'] = False
+        _set_align_state(saved, rw=rw, rh=rh)
+        st.session_state['ir_loaded_align'] = bool(saved)
 
     if st.session_state.get('ir_loaded_align'):
         st.info('Existing alignment loaded — adjust and re-save to update.')
+
+    # Copy a saved alignment from another dataset/session into the current one.
+    other = alignments[~((alignments.get('ref_num') == sel_ref_num)
+                         & (alignments.get('session_name') == tp_row['session_name'])
+                         & (alignments.get('dataset_name') == tp_row['dataset_name']))] \
+        if not alignments.empty else alignments
+    if not other.empty:
+        with st.expander('Copy alignment from another dataset'):
+            copy_opts = {
+                f"ref{int(r['ref_num'])}: {r['session_name']}/{r['dataset_name']}":
+                    (int(r['ref_num']), r['session_name'], r['dataset_name'])
+                for _, r in other.iterrows()}
+            csel = st.selectbox('Source alignment', list(copy_opts.keys()), key='ir_copy_src')
+            if st.button('Copy parameters', key='ir_copy_btn'):
+                s_ref, s_sess, s_dset = copy_opts[csel]
+                src = get_saved_alignment(subject_name, s_ref, s_sess, s_dset)
+                _set_align_state(src, rw=rw, rh=rh)
+                st.session_state['ir_loaded_align'] = True
+                st.success(f'Copied parameters from {csel}.')
+                st.rerun()
 
     # Drain any pending click update into the slider keys before the widgets render
     if 'ir_ox_pending' in st.session_state:
@@ -427,8 +465,8 @@ def _imaging_reference_tab(schema, WfieldParameters, WfieldStack):
     with st.expander('FOV offset (optional)'):
         st.caption('Row and column offset if the segmentation output is cropped relative to the raw 2P image.')
         fo1, fo2 = st.columns(2)
-        fov_row_off = int(fo1.number_input('Row offset', value=0, min_value=0, key='ir_fov_row'))
-        fov_col_off = int(fo2.number_input('Col offset', value=0, min_value=0, key='ir_fov_col'))
+        fov_row_off = int(fo1.number_input('Row offset', min_value=0, key='ir_fov_row'))
+        fov_col_off = int(fo2.number_input('Col offset', min_value=0, key='ir_fov_col'))
     fov_offset = (np.array([fov_row_off, fov_col_off], dtype=float)
                   if (fov_row_off or fov_col_off) else None)
 
@@ -436,12 +474,12 @@ def _imaging_reference_tab(schema, WfieldParameters, WfieldStack):
     ac1, ac2, ac3 = st.columns(3)
     ac4, ac5, ac6 = st.columns(3)
     ac7, ac8, _   = st.columns(3)
-    rotation    = ac1.slider('Rotation (°)', -180.0, 180.0, 0.0, step=0.5, key='ir_rot')
-    scale       = ac2.slider('Scale (px/px)', 0.01, 1.0, 0.1, step=0.005, key='ir_scale')
-    ratio       = ac3.slider('X/Y aspect ratio', 0.5, 2.0, 1.0, step=0.005, key='ir_ratio')
+    rotation    = ac1.slider('Rotation (°)', -180.0, 180.0, step=0.5, key='ir_rot')
+    scale       = ac2.slider('Scale (px/px)', 0.01, 1.0, step=0.005, key='ir_scale')
+    ratio       = ac3.slider('X/Y aspect ratio', 0.5, 2.0, step=0.005, key='ir_ratio')
     origin_x    = float(ac4.slider('Origin X (col)', 0, rw, key='ir_ox_slider'))
     origin_y    = float(ac5.slider('Origin Y (row)', 0, rh, key='ir_oy_slider'))
-    transpose   = ac6.checkbox('Transpose 2P image', value=False, key='ir_transpose')
+    transpose   = ac6.checkbox('Transpose 2P image', key='ir_transpose')
     alpha_blend = ac7.slider('2P overlay alpha', 0.0, 1.0, 0.5, step=0.05, key='ir_alpha')
     color_mode  = ac8.checkbox('Color (WF=green, 2P=red)', value=False, key='ir_color_mode')
     st.caption(
