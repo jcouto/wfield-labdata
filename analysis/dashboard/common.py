@@ -119,7 +119,11 @@ SCHEMA_REFERENCE = {
         '(rotation / scale / ratio / transpose / origin / fov_offset).',
         {'get_transform(fw, fh)': 'return (M_fwd, transpose, fov_offset): 2P (col,row) → reference px',
          'apply_transform(image, output_shape=None)':
-            'warp a 2P image or N x H x W movie into the reference image pixel space'},
+            'warp a 2P image or N x H x W movie into the reference image pixel space',
+         'points_to_atlas(xy, atlas_transform, fov_dims=None)':
+            'map 2P (col,row) points to atlas mm via a WidefieldAtlasTransform',
+         'plot_fov_on_atlas(atlas_transform, ax=None, fov_dims=None, atlas_regions=True, **kw)':
+            'plot the imaged FOV outline in atlas mm over the region contours'},
         {},
     ),
     'WidefieldAtlas': (
