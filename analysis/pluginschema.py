@@ -507,9 +507,34 @@ class TwoPhotonReferenceAlignment(dj.Manual):
         out = np.stack(out)
         return out if is_movie else out[0]
 
+    def _fov_dims(self):
+        """Raw 2P frame ``(width, height)`` for this (single-row) alignment.
+
+        Matches the image the alignment was built against: the CellSegmentation
+        plane dims plus the FOV offset (same as ``overlay_projections_on_reference``),
+        falling back to the TwoPhoton frame size.
+        """
+        row = self.fetch1()
+        fov = row.get('fov_offset')
+        row_off, col_off = (int(fov[0]), int(fov[1])) if fov is not None else (0, 0)
+        try:
+            from labdata.schema import CellSegmentation
+            dims = (CellSegmentation.Plane & dict(
+                subject_name=row['subject_name'], session_name=row['session_name'],
+                dataset_name=row['dataset_name'])).fetch('dims', limit=1)
+            if len(dims) and dims[0] is not None:
+                d = np.asarray(dims[0]).ravel()        # (height, width)
+                return int(d[1]) + col_off, int(d[0]) + row_off
+        except Exception:
+            pass
+        from labdata.schema import TwoPhoton
+        w, h = (TwoPhoton & self).fetch1('width', 'height')
+        return int(w), int(h)
+
     def _resolve_atlas_transform(self, atlas_name=None, atlas_transform_id=None):
-        """Return the WidefieldAtlasTransform for an alignment's
-        reference widefield session. Warns and keeps the first when several match.
+        """Return the WidefieldAtlasTransform for an alignment's reference widefield
+        session. Warns and uses the latest (highest ``atlas_transform_id``) when
+        several match — matching the dashboard, which defaults to the most recent.
         """
         import warnings
         key = self.fetch1('KEY')
@@ -527,9 +552,11 @@ class TwoPhotonReferenceAlignment(dj.Manual):
             raise ValueError('No WidefieldAtlasTransform for widefield session '
                              f'{key["subject_name"]}/{ref_session}/{ref_dataset}.')
         if len(xf) > 1:
+            chosen = int(max(xf.fetch('atlas_transform_id')))
             warnings.warn(f'{len(xf)} WidefieldAtlasTransforms for '
-                          f'{key["subject_name"]}/{ref_session}/{ref_dataset}; using the first.')
-            xf = WidefieldAtlasTransform & xf.fetch('KEY')[0]
+                          f'{key["subject_name"]}/{ref_session}/{ref_dataset}; using the latest '
+                          f'(atlas_transform_id={chosen}). Pass atlas_transform_id=... to pick one.')
+            xf = xf & dict(atlas_transform_id=chosen)
         return xf
 
     def points_to_atlas(self, xy, atlas_transform=None, fov_dims=None,
@@ -549,7 +576,8 @@ class TwoPhotonReferenceAlignment(dj.Manual):
             automatically from this alignment's reference widefield session
             (warning and using the first if several match).
         fov_dims : (width, height), optional
-            Raw 2P frame size in pixels. Defaults to the TwoPhoton width/height.
+            Raw 2P frame size in pixels. Defaults to the size the alignment was
+            built against (CellSegmentation plane dims + fov_offset, else TwoPhoton).
         atlas_name, atlas_transform_id : optional
             Narrow the auto-resolved transform when several exist.
 
@@ -565,9 +593,7 @@ class TwoPhotonReferenceAlignment(dj.Manual):
             atlas_transform = WidefieldAtlasTransform & atlas_transform
 
         if fov_dims is None:
-            from labdata.schema import TwoPhoton
-            wh = (TwoPhoton & self).fetch1('width', 'height')
-            fw, fh = int(wh[0]), int(wh[1])
+            fw, fh = self._fov_dims()
         else:
             fw, fh = int(fov_dims[0]), int(fov_dims[1])
 
@@ -598,7 +624,8 @@ class TwoPhotonReferenceAlignment(dj.Manual):
         atlas_name, atlas_transform_id : optional
             Narrow the auto-resolved transform when several exist for a session.
         fov_dims : (width, height), optional
-            Raw 2P frame size in pixels; defaults to each row's TwoPhoton size.
+            Raw 2P frame size in pixels; defaults per row to the size the alignment
+            was built against (CellSegmentation plane dims + fov_offset, else TwoPhoton).
         cmap : str
             Matplotlib colormap name used to colour the per-row FOV outlines.
         color_regions : color or None
@@ -615,14 +642,13 @@ class TwoPhotonReferenceAlignment(dj.Manual):
         import warnings
         import matplotlib.pyplot as plt
         import pandas as pd
-        from labdata.schema import TwoPhoton
 
         keys = list(self.fetch('KEY'))
         if not keys:
             raise ValueError('No TwoPhotonReferenceAlignment rows in the query.')
 
         if ax is None:
-            _, ax = plt.subplots()
+            ax = plt.gca()
         cmap = plt.get_cmap(cmap, max(len(keys), 1))
 
         first_xf = None
@@ -643,8 +669,7 @@ class TwoPhotonReferenceAlignment(dj.Manual):
                 first_xf = xf
 
             if fov_dims is None:
-                wh = (TwoPhoton & one).fetch1('width', 'height')
-                fw, fh = int(wh[0]), int(wh[1])
+                fw, fh = one._fov_dims()
             else:
                 fw, fh = int(fov_dims[0]), int(fov_dims[1])
             corners = np.array([[0, 0], [fw, 0], [fw, fh], [0, fh], [0, 0]], dtype=float)
