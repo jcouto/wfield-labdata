@@ -123,7 +123,7 @@ class WfieldStack(dj.Computed):
         ]
         # store the results
         dataset = dict(**key)
-        dataset['dataset_name'] = f'wfield_{par["wfield_analysis_id"]:02d}'
+        dataset['dataset_name'] = f'{key["dataset_name"]}_wfield_{par["wfield_analysis_id"]:02d}'
         from labdata.schema import AnalysisFile 
         resultsfolder = AnalysisFile().generate_filepaths([''],dataset)
         resultsfolder = Path(prefs['local_paths'][0])/resultsfolder[0]
