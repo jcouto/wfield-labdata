@@ -508,7 +508,7 @@ class TwoPhotonReferenceAlignment(dj.Manual):
         return out if is_movie else out[0]
 
     def _resolve_atlas_transform(self, atlas_name=None, atlas_transform_id=None):
-        """Return the WidefieldAtlasTransform for this (single-row) alignment's
+        """Return the WidefieldAtlasTransform for an alignment's
         reference widefield session. Warns and keeps the first when several match.
         """
         import warnings
@@ -581,7 +581,8 @@ class TwoPhotonReferenceAlignment(dj.Manual):
 
     def plot_fov_on_atlas(self, ax=None, atlas_transform=None, atlas_name=None,
                           atlas_transform_id=None, fov_dims=None,
-                          atlas_regions=True, **kwargs):
+                          cmap = 'tab10',
+                          color_regions = 'k', lw_regions = 1, **kwargs):
         """Plot the imaged 2P field-of-view outline(s) in atlas (mm) coordinates.
 
         Iterates over every row in the query, drawing each dataset's raw 2P frame
@@ -596,9 +597,16 @@ class TwoPhotonReferenceAlignment(dj.Manual):
             Use this transform for every row instead of auto-resolving per row.
         atlas_name, atlas_transform_id : optional
             Narrow the auto-resolved transform when several exist for a session.
-        fov_dims : (width, height), optional — defaults to each row's TwoPhoton size.
-        atlas_regions : bool — draw the atlas region contours (mm) as a backdrop.
-        **kwargs — forwarded to ax.plot() for the FOV outlines.
+        fov_dims : (width, height), optional
+            Raw 2P frame size in pixels; defaults to each row's TwoPhoton size.
+        cmap : str
+            Matplotlib colormap name used to colour the per-row FOV outlines.
+        color_regions : color or None
+            Colour of the atlas region contours; set to None to skip drawing them.
+        lw_regions : float
+            Line width of the atlas region contours.
+        **kwargs
+            Forwarded to ax.plot() for the FOV outlines (e.g. lw, linestyle).
 
         Returns
         -------
@@ -615,7 +623,7 @@ class TwoPhotonReferenceAlignment(dj.Manual):
 
         if ax is None:
             _, ax = plt.subplots()
-        cmap = plt.get_cmap('tab10', max(len(keys), 1))
+        cmap = plt.get_cmap(cmap, max(len(keys), 1))
 
         first_xf = None
         plotted = 0
@@ -642,7 +650,7 @@ class TwoPhotonReferenceAlignment(dj.Manual):
             corners = np.array([[0, 0], [fw, 0], [fw, fh], [0, fh], [0, 0]], dtype=float)
             corners_mm = one.points_to_atlas(corners, atlas_transform=xf, fov_dims=(fw, fh))
 
-            kw = dict(lw=1.5, color=cmap(i))
+            kw = dict(lw=1.5, color=cmap(i)) # default parameters for the lw and color
             kw.update(kwargs)
             ax.plot(corners_mm[:, 0], corners_mm[:, 1],
                     label=f"{key['session_name']}/{key['dataset_name']}", **kw)
@@ -651,20 +659,16 @@ class TwoPhotonReferenceAlignment(dj.Manual):
         if plotted == 0:
             raise ValueError('No FOVs plotted — no matching WidefieldAtlasTransform found.')
 
-        if atlas_regions and first_xf is not None:
+        if first_xf is not None and not color_regions is None:
             ccf_regions, _, _ = first_xf.load_reference()
             regions = pd.DataFrame(ccf_regions)
             for _, reg in regions.iterrows():
                 for side in ('left', 'right'):
                     ax.plot(np.asarray(reg[f'{side}_x'], dtype=float),
                             np.asarray(reg[f'{side}_y'], dtype=float),
-                            '-', color='0.6', lw=0.5, zorder=0)
+                            '-', color=color_regions, lw=lw_regions, zorder=0)
 
-        ax.set_xlabel('ML (mm from bregma)')
-        ax.set_ylabel('AP (mm from bregma)')
         ax.set_aspect('equal')
-        if plotted > 1:
-            ax.legend(fontsize=7)
         return ax
 
 
