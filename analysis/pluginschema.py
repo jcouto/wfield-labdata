@@ -507,7 +507,33 @@ class TwoPhotonReferenceAlignment(dj.Manual):
         out = np.stack(out)
         return out if is_movie else out[0]
 
-    def points_to_atlas(self, xy, atlas_transform, fov_dims=None):
+    def _resolve_atlas_transform(self, atlas_name=None, atlas_transform_id=None):
+        """Return the WidefieldAtlasTransform for this (single-row) alignment's
+        reference widefield session. Warns and keeps the first when several match.
+        """
+        import warnings
+        key = self.fetch1('KEY')
+        ref_session, ref_dataset = (ImagingReference & dict(
+            subject_name=key['subject_name'], ref_num=key['ref_num'])).fetch1(
+            'ref_session', 'ref_dataset')
+        restr = dict(subject_name=key['subject_name'],
+                     session_name=ref_session, dataset_name=ref_dataset)
+        if atlas_name is not None:
+            restr['atlas_name'] = atlas_name
+        if atlas_transform_id is not None:
+            restr['atlas_transform_id'] = atlas_transform_id
+        xf = WidefieldAtlasTransform & restr
+        if len(xf) == 0:
+            raise ValueError('No WidefieldAtlasTransform for widefield session '
+                             f'{key["subject_name"]}/{ref_session}/{ref_dataset}.')
+        if len(xf) > 1:
+            warnings.warn(f'{len(xf)} WidefieldAtlasTransforms for '
+                          f'{key["subject_name"]}/{ref_session}/{ref_dataset}; using the first.')
+            xf = WidefieldAtlasTransform & xf.fetch('KEY')[0]
+        return xf
+
+    def points_to_atlas(self, xy, atlas_transform=None, fov_dims=None,
+                        atlas_name=None, atlas_transform_id=None):
         """Map 2P pixel points to atlas mm coordinates (bregma origin).
 
         Composes this alignment (2P → reference pixels) with the inverse of a
@@ -518,10 +544,14 @@ class TwoPhotonReferenceAlignment(dj.Manual):
         ----------
         xy : array-like, shape (N, 2) or (2,)
             Points as ``(col, row)`` in the **raw 2P frame** pixel space.
-        atlas_transform : WidefieldAtlasTransform query (single row) or restriction
-            The atlas registration of this reference's widefield session.
+        atlas_transform : WidefieldAtlasTransform query / restriction, optional
+            The atlas registration to use. When omitted it is resolved
+            automatically from this alignment's reference widefield session
+            (warning and using the first if several match).
         fov_dims : (width, height), optional
             Raw 2P frame size in pixels. Defaults to the TwoPhoton width/height.
+        atlas_name, atlas_transform_id : optional
+            Narrow the auto-resolved transform when several exist.
 
         Returns
         -------
@@ -529,7 +559,9 @@ class TwoPhotonReferenceAlignment(dj.Manual):
             ``(x_mm, y_mm)`` atlas coordinates (mm from bregma).
         """
         from .utils import transform_coordinates
-        if isinstance(atlas_transform, (dict, str, list, tuple)):
+        if atlas_transform is None:
+            atlas_transform = self._resolve_atlas_transform(atlas_name, atlas_transform_id)
+        elif isinstance(atlas_transform, (dict, str, list, tuple)):
             atlas_transform = WidefieldAtlasTransform & atlas_transform
 
         if fov_dims is None:
@@ -547,57 +579,92 @@ class TwoPhotonReferenceAlignment(dj.Manual):
         ref_px = transform_coordinates(pts, M_fwd)     # reference pixels
         return transform_coordinates(ref_px, M_atlas_inv)   # atlas mm
 
-    def plot_fov_on_atlas(self, atlas_transform, ax=None, fov_dims=None,
+    def plot_fov_on_atlas(self, ax=None, atlas_transform=None, atlas_name=None,
+                          atlas_transform_id=None, fov_dims=None,
                           atlas_regions=True, **kwargs):
-        """Plot the imaged 2P field-of-view outline in atlas (mm) coordinates.
+        """Plot the imaged 2P field-of-view outline(s) in atlas (mm) coordinates.
 
-        The raw 2P frame corners are transformed with `points_to_atlas` using the
-        given atlas transform and drawn as a closed quadrilateral, optionally over
-        the atlas region contours.
+        Iterates over every row in the query, drawing each dataset's raw 2P frame
+        as a closed quadrilateral mapped to atlas mm via `points_to_atlas`. The
+        atlas transform for each row is found automatically from its reference
+        widefield session unless one is passed explicitly.
 
         Parameters
         ----------
-        atlas_transform : WidefieldAtlasTransform query (single row) or restriction
         ax : matplotlib Axes, optional
-        fov_dims : (width, height), optional — defaults to the TwoPhoton size.
+        atlas_transform : WidefieldAtlasTransform query / restriction, optional
+            Use this transform for every row instead of auto-resolving per row.
+        atlas_name, atlas_transform_id : optional
+            Narrow the auto-resolved transform when several exist for a session.
+        fov_dims : (width, height), optional — defaults to each row's TwoPhoton size.
         atlas_regions : bool — draw the atlas region contours (mm) as a backdrop.
-        **kwargs — forwarded to ax.plot() for the FOV outline.
+        **kwargs — forwarded to ax.plot() for the FOV outlines.
 
         Returns
         -------
         ax : matplotlib Axes
         """
+        import warnings
         import matplotlib.pyplot as plt
         import pandas as pd
-        if isinstance(atlas_transform, (dict, str, list, tuple)):
-            atlas_transform = WidefieldAtlasTransform & atlas_transform
+        from labdata.schema import TwoPhoton
 
-        if fov_dims is None:
-            from labdata.schema import TwoPhoton
-            wh = (TwoPhoton & self).fetch1('width', 'height')
-            fw, fh = int(wh[0]), int(wh[1])
-        else:
-            fw, fh = int(fov_dims[0]), int(fov_dims[1])
-
-        corners = np.array([[0, 0], [fw, 0], [fw, fh], [0, fh], [0, 0]], dtype=float)
-        corners_mm = self.points_to_atlas(corners, atlas_transform, fov_dims=(fw, fh))
+        keys = list(self.fetch('KEY'))
+        if not keys:
+            raise ValueError('No TwoPhotonReferenceAlignment rows in the query.')
 
         if ax is None:
             _, ax = plt.subplots()
-        if atlas_regions:
-            ccf_regions, _, _ = atlas_transform.load_reference()
+        cmap = plt.get_cmap('tab10', max(len(keys), 1))
+
+        first_xf = None
+        plotted = 0
+        for i, key in enumerate(keys):
+            one = self & key
+            if atlas_transform is not None:
+                xf = (WidefieldAtlasTransform & atlas_transform
+                      if isinstance(atlas_transform, (dict, str, list, tuple))
+                      else atlas_transform)
+            else:
+                try:
+                    xf = one._resolve_atlas_transform(atlas_name, atlas_transform_id)
+                except ValueError as exc:
+                    warnings.warn(str(exc))
+                    continue
+            if first_xf is None:
+                first_xf = xf
+
+            if fov_dims is None:
+                wh = (TwoPhoton & one).fetch1('width', 'height')
+                fw, fh = int(wh[0]), int(wh[1])
+            else:
+                fw, fh = int(fov_dims[0]), int(fov_dims[1])
+            corners = np.array([[0, 0], [fw, 0], [fw, fh], [0, fh], [0, 0]], dtype=float)
+            corners_mm = one.points_to_atlas(corners, atlas_transform=xf, fov_dims=(fw, fh))
+
+            kw = dict(lw=1.5, color=cmap(i))
+            kw.update(kwargs)
+            ax.plot(corners_mm[:, 0], corners_mm[:, 1],
+                    label=f"{key['session_name']}/{key['dataset_name']}", **kw)
+            plotted += 1
+
+        if plotted == 0:
+            raise ValueError('No FOVs plotted — no matching WidefieldAtlasTransform found.')
+
+        if atlas_regions and first_xf is not None:
+            ccf_regions, _, _ = first_xf.load_reference()
             regions = pd.DataFrame(ccf_regions)
             for _, reg in regions.iterrows():
                 for side in ('left', 'right'):
                     ax.plot(np.asarray(reg[f'{side}_x'], dtype=float),
                             np.asarray(reg[f'{side}_y'], dtype=float),
-                            '-', color='0.6', lw=0.5)
-        kw = dict(color='red', lw=1.5)
-        kw.update(kwargs)
-        ax.plot(corners_mm[:, 0], corners_mm[:, 1], **kw)
+                            '-', color='0.6', lw=0.5, zorder=0)
+
         ax.set_xlabel('ML (mm from bregma)')
         ax.set_ylabel('AP (mm from bregma)')
         ax.set_aspect('equal')
+        if plotted > 1:
+            ax.legend(fontsize=7)
         return ax
 
 
