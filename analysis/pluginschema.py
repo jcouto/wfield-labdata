@@ -890,6 +890,106 @@ class WidefieldAtlasTransform(dj.Manual):
         """Return (ccf_regions, proj, brain_outline) for this atlas."""
         return (WidefieldAtlas & self.proj()).load()
 
+    def _atlas_pixel_transform(self):
+        """Return (M_px, projection) mapping atlas *projection pixels* to widefield pixels.
+
+        ``get_transform()`` maps atlas mm -> widefield px; the atlas projection
+        image relates its own pixels to mm through the atlas ``reference_point``
+        ([row, col] of bregma) and ``resolution`` (mm/px), the same convention as
+        ``WidefieldAtlas.plot_atlas``. Composing the two gives a single 3x3 matrix
+        mapping atlas-projection (col, row) pixels to widefield (col, row) pixels.
+        """
+        ref_row, ref_col = np.asarray(
+            (WidefieldAtlas & self.proj()).fetch1('reference_point'), dtype=float).ravel()[:2]
+        res = float((WidefieldAtlas & self.proj()).fetch1('resolution'))
+        projection = np.squeeze(np.asarray((WidefieldAtlas & self.proj()).fetch1('projection')))
+        # atlas px (col, row) -> atlas mm (x, y)
+        T_atlas = np.array([[res, 0.0, -res * ref_col],
+                            [0.0, res, -res * ref_row],
+                            [0.0, 0.0, 1.0]], dtype=float)
+        M_px = np.asarray(self.get_transform()) @ T_atlas
+        return M_px, projection
+
+    def _widefield_reference(self):
+        """Widefield mean projection (2-D float) for this transform's session.
+
+        Uses the WfieldStack mean projection with the lowest ``wfield_analysis_id``.
+        """
+        row = self.fetch1()
+        key = dict(subject_name=row['subject_name'], session_name=row['session_name'],
+                   dataset_name=row['dataset_name'])
+        aids = (WfieldStack & key).fetch('wfield_analysis_id')
+        if not len(aids):
+            raise ValueError('No WfieldStack mean projection for this session — '
+                             'pass output_shape (or an image) explicitly.')
+        mp = (WfieldStack & dict(key, wfield_analysis_id=int(min(aids)))).fetch1('mean_proj')
+        mp = np.squeeze(np.asarray(mp)).astype(float)
+        return mp[0] if mp.ndim == 3 else mp   # mean_proj is channel-first
+
+    def image_to_atlas(self, image, output_shape=None, **kwargs):
+        """Warp a widefield image into atlas-projection pixel space.
+
+        Parameters
+        ----------
+        image : ndarray
+            Widefield image (H x W) or movie (N x H x W) in this session's
+            widefield pixel space.
+        output_shape : (H, W), optional
+            Shape of the atlas-space output. Defaults to the atlas projection shape.
+        **kwargs
+            Forwarded to `warp_image` (e.g. ``order``, ``cval``).
+
+        Returns
+        -------
+        warped : ndarray (float)
+            The image resampled into atlas-projection coordinates; an (N, H, W)
+            movie warps frame by frame.
+        """
+        from .utils import warp_image
+        M_px, projection = self._atlas_pixel_transform()
+        if output_shape is None:
+            output_shape = projection.shape[:2]
+        # forward map is widefield px -> atlas px = inverse of atlas -> widefield
+        M_fwd = np.linalg.inv(M_px)
+        return self._warp(image, M_fwd, output_shape, warp_image, **kwargs)
+
+    def atlas_to_image(self, projection=None, output_shape=None, **kwargs):
+        """Warp the atlas projection into widefield image pixel space.
+
+        Parameters
+        ----------
+        projection : ndarray, optional
+            Image in atlas-projection pixel space to warp. Defaults to this
+            atlas's stored projection.
+        output_shape : (H, W), optional
+            Shape of the widefield-space output. Defaults to this session's
+            widefield mean-projection shape (lowest WfieldStack analysis id).
+        **kwargs
+            Forwarded to `warp_image` (e.g. ``order``, ``cval``).
+
+        Returns
+        -------
+        warped : ndarray (float)
+            The projection resampled into widefield-image coordinates.
+        """
+        from .utils import warp_image
+        M_px, atlas_proj = self._atlas_pixel_transform()
+        if projection is None:
+            projection = atlas_proj
+        if output_shape is None:
+            output_shape = self._widefield_reference().shape[:2]
+        # forward map is atlas px -> widefield px
+        return self._warp(projection, M_px, output_shape, warp_image, **kwargs)
+
+    @staticmethod
+    def _warp(image, M_fwd, output_shape, warp_image, **kwargs):
+        image = np.asarray(image, dtype=float)
+        if image.ndim not in (2, 3):
+            raise ValueError('image must be 2-D (H x W) or 3-D (N x H x W).')
+        if image.ndim == 2:
+            return warp_image(image, M_fwd, output_shape, **kwargs)
+        return np.stack([warp_image(f, M_fwd, output_shape, **kwargs) for f in image])
+
     def transform_regions(self, ccf_regions=None):
         """Return ccf_regions DataFrame transformed to widefield pixel coordinates."""
         import pandas as pd
