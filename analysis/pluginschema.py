@@ -974,9 +974,9 @@ class WidefieldAtlasTransform(dj.Manual):
             # blank the opposite hemisphere in place, keeping the full atlas frame
             # so the result stays pixel-aligned with the 'both' output
             if hemisphere == 'left':
-                warped[..., c:] = 0
+                warped = warped[..., c:]
             else:
-                warped[..., :c] = 0
+                warped = warped[..., :c]
         return warped
 
     def atlas_to_image(self, projection=None, output_shape=None, **kwargs):
