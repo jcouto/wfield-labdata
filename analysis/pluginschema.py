@@ -946,10 +946,11 @@ class WidefieldAtlasTransform(dj.Manual):
         output_shape : (H, W), optional
             Shape of the atlas-space output. Defaults to the atlas projection shape.
         hemisphere : {'both', 'left', 'right'}
-            Crop the atlas-space result at the midline (bregma column). ``'left'``
-            returns columns west of bregma (x < 0), ``'right'`` those east of it.
-            Cropping is a plain column slice, so the two halves keep their native
-            orientation (and may differ in width). Default ``'both'`` (no crop).
+            Keep only one hemisphere by blanking the columns on the far side of the
+            midline (bregma column) to 0, while keeping the full atlas frame so the
+            result stays pixel-aligned with the ``'both'`` output. ``'left'`` keeps
+            x < 0 (columns west of bregma), ``'right'`` keeps x > 0. Default
+            ``'both'`` (no blanking).
         **kwargs
             Forwarded to `warp_image` (e.g. ``order``, ``cval``).
 
@@ -967,11 +968,14 @@ class WidefieldAtlasTransform(dj.Manual):
         # forward map is widefield px -> atlas px = inverse of atlas -> widefield
         M_fwd = np.linalg.inv(M_px)
         warped = self._warp(image, M_fwd, output_shape, warp_image, **kwargs)
-        c = int(round(ref_col))
-        if hemisphere == 'left':
-            warped = warped[..., :c]
-        elif hemisphere == 'right':
-            warped = warped[..., c:]
+        if hemisphere != 'both':
+            c = int(round(ref_col))
+            # blank the opposite hemisphere in place, keeping the full atlas frame
+            # so the result stays pixel-aligned with the 'both' output
+            if hemisphere == 'left':
+                warped[..., c:] = 0
+            else:
+                warped[..., :c] = 0
         return warped
 
     def atlas_to_image(self, projection=None, output_shape=None, hemisphere='both', **kwargs):
