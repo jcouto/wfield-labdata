@@ -917,7 +917,7 @@ class WidefieldAtlasTransform(dj.Manual):
                             [0.0, res, -res * ref_row],
                             [0.0, 0.0, 1.0]], dtype=float)
         M_px = np.asarray(self.get_transform()) @ T_atlas
-        return M_px, projection, ref_col
+        return M_px, projection
 
     def _widefield_reference(self):
         """Widefield mean projection (2-D float) for this transform's session.
@@ -962,7 +962,8 @@ class WidefieldAtlasTransform(dj.Manual):
         """
         from .utils import warp_image
         _check_hemisphere(hemisphere)
-        M_px, projection, ref_col = self._atlas_pixel_transform()
+        M_px, projection = self._atlas_pixel_transform()
+        ref_col = projection.shape[1]/2
         if output_shape is None:
             output_shape = projection.shape[:2]
         # forward map is widefield px -> atlas px = inverse of atlas -> widefield
@@ -978,7 +979,7 @@ class WidefieldAtlasTransform(dj.Manual):
                 warped[..., :c] = 0
         return warped
 
-    def atlas_to_image(self, projection=None, output_shape=None, hemisphere='both', **kwargs):
+    def atlas_to_image(self, projection=None, output_shape=None, **kwargs):
         """Warp the atlas projection into widefield image pixel space.
 
         Parameters
@@ -989,11 +990,6 @@ class WidefieldAtlasTransform(dj.Manual):
         output_shape : (H, W), optional
             Shape of the widefield-space output. Defaults to this session's
             widefield mean-projection shape (lowest WfieldStack analysis id).
-        hemisphere : {'both', 'left', 'right'}
-            Keep only one hemisphere: the atlas midline (bregma column) is cropped
-            in atlas space *before* warping, so the opposite hemisphere is blanked
-            (the midline maps to a curve in widefield space, not a column). ``'left'``
-            keeps x < 0, ``'right'`` keeps x > 0. Default ``'both'`` (no crop).
         **kwargs
             Forwarded to `warp_image` (e.g. ``order``, ``cval``).
 
@@ -1004,19 +1000,11 @@ class WidefieldAtlasTransform(dj.Manual):
         """
         from .utils import warp_image
         _check_hemisphere(hemisphere)
-        M_px, atlas_proj, ref_col = self._atlas_pixel_transform()
+        M_px, atlas_proj = self._atlas_pixel_transform()
         if projection is None:
             projection = atlas_proj
         if output_shape is None:
             output_shape = self._widefield_reference().shape[:2]
-        if hemisphere != 'both':
-            projection = np.asarray(projection, dtype=float).copy()
-            c = int(round(ref_col))
-            # blank the opposite hemisphere (columns) before warping
-            if hemisphere == 'left':
-                projection[..., c:] = 0
-            else:
-                projection[..., :c] = 0
         # forward map is atlas px -> widefield px
         return self._warp(projection, M_px, output_shape, warp_image, **kwargs)
 
