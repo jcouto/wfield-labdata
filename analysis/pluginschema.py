@@ -9,6 +9,13 @@ __all__ = ['WfieldParameters', 'WfieldStack', 'ImagingWindow',
 
 userschema = get_user_schema()
 
+
+def _check_hemisphere(hemisphere):
+    if hemisphere not in ('both', 'left', 'right'):
+        raise ValueError(
+            f"hemisphere must be 'both', 'left' or 'right', got {hemisphere!r}.")
+
+
 @userschema
 class WfieldParameters(dj.Manual):
     definition = '''
@@ -891,13 +898,15 @@ class WidefieldAtlasTransform(dj.Manual):
         return (WidefieldAtlas & self.proj()).load()
 
     def _atlas_pixel_transform(self):
-        """Return (M_px, projection) mapping atlas *projection pixels* to widefield pixels.
+        """Return (M_px, projection, ref_col) mapping atlas *projection pixels* to widefield px.
 
         ``get_transform()`` maps atlas mm -> widefield px; the atlas projection
         image relates its own pixels to mm through the atlas ``reference_point``
         ([row, col] of bregma) and ``resolution`` (mm/px), the same convention as
         ``WidefieldAtlas.plot_atlas``. Composing the two gives a single 3x3 matrix
         mapping atlas-projection (col, row) pixels to widefield (col, row) pixels.
+        ``ref_col`` is the bregma column, i.e. the atlas midline separating the
+        left (x < 0, col < ref_col) and right (x > 0) hemispheres.
         """
         ref_row, ref_col = np.asarray(
             (WidefieldAtlas & self.proj()).fetch1('reference_point'), dtype=float).ravel()[:2]
@@ -908,7 +917,7 @@ class WidefieldAtlasTransform(dj.Manual):
                             [0.0, res, -res * ref_row],
                             [0.0, 0.0, 1.0]], dtype=float)
         M_px = np.asarray(self.get_transform()) @ T_atlas
-        return M_px, projection
+        return M_px, projection, ref_col
 
     def _widefield_reference(self):
         """Widefield mean projection (2-D float) for this transform's session.
@@ -926,7 +935,7 @@ class WidefieldAtlasTransform(dj.Manual):
         mp = np.squeeze(np.asarray(mp)).astype(float)
         return mp[0] if mp.ndim == 3 else mp   # mean_proj is channel-first
 
-    def image_to_atlas(self, image, output_shape=None, **kwargs):
+    def image_to_atlas(self, image, output_shape=None, hemisphere='both', **kwargs):
         """Warp a widefield image into atlas-projection pixel space.
 
         Parameters
@@ -936,6 +945,11 @@ class WidefieldAtlasTransform(dj.Manual):
             widefield pixel space.
         output_shape : (H, W), optional
             Shape of the atlas-space output. Defaults to the atlas projection shape.
+        hemisphere : {'both', 'left', 'right'}
+            Crop the atlas-space result at the midline (bregma column). ``'left'``
+            returns columns west of bregma (x < 0), ``'right'`` those east of it.
+            Cropping is a plain column slice, so the two halves keep their native
+            orientation (and may differ in width). Default ``'both'`` (no crop).
         **kwargs
             Forwarded to `warp_image` (e.g. ``order``, ``cval``).
 
@@ -946,14 +960,21 @@ class WidefieldAtlasTransform(dj.Manual):
             movie warps frame by frame.
         """
         from .utils import warp_image
-        M_px, projection = self._atlas_pixel_transform()
+        _check_hemisphere(hemisphere)
+        M_px, projection, ref_col = self._atlas_pixel_transform()
         if output_shape is None:
             output_shape = projection.shape[:2]
         # forward map is widefield px -> atlas px = inverse of atlas -> widefield
         M_fwd = np.linalg.inv(M_px)
-        return self._warp(image, M_fwd, output_shape, warp_image, **kwargs)
+        warped = self._warp(image, M_fwd, output_shape, warp_image, **kwargs)
+        c = int(round(ref_col))
+        if hemisphere == 'left':
+            warped = warped[..., :c]
+        elif hemisphere == 'right':
+            warped = warped[..., c:]
+        return warped
 
-    def atlas_to_image(self, projection=None, output_shape=None, **kwargs):
+    def atlas_to_image(self, projection=None, output_shape=None, hemisphere='both', **kwargs):
         """Warp the atlas projection into widefield image pixel space.
 
         Parameters
@@ -964,6 +985,11 @@ class WidefieldAtlasTransform(dj.Manual):
         output_shape : (H, W), optional
             Shape of the widefield-space output. Defaults to this session's
             widefield mean-projection shape (lowest WfieldStack analysis id).
+        hemisphere : {'both', 'left', 'right'}
+            Keep only one hemisphere: the atlas midline (bregma column) is cropped
+            in atlas space *before* warping, so the opposite hemisphere is blanked
+            (the midline maps to a curve in widefield space, not a column). ``'left'``
+            keeps x < 0, ``'right'`` keeps x > 0. Default ``'both'`` (no crop).
         **kwargs
             Forwarded to `warp_image` (e.g. ``order``, ``cval``).
 
@@ -973,11 +999,20 @@ class WidefieldAtlasTransform(dj.Manual):
             The projection resampled into widefield-image coordinates.
         """
         from .utils import warp_image
-        M_px, atlas_proj = self._atlas_pixel_transform()
+        _check_hemisphere(hemisphere)
+        M_px, atlas_proj, ref_col = self._atlas_pixel_transform()
         if projection is None:
             projection = atlas_proj
         if output_shape is None:
             output_shape = self._widefield_reference().shape[:2]
+        if hemisphere != 'both':
+            projection = np.asarray(projection, dtype=float).copy()
+            c = int(round(ref_col))
+            # blank the opposite hemisphere (columns) before warping
+            if hemisphere == 'left':
+                projection[..., c:] = 0
+            else:
+                projection[..., :c] = 0
         # forward map is atlas px -> widefield px
         return self._warp(projection, M_px, output_shape, warp_image, **kwargs)
 
