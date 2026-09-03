@@ -65,6 +65,12 @@ def _sessions_params_tab(schema, WfieldParameters, WfieldStack):
         if pts and pts[0].get('subject_name') in subjects:
             st.session_state['wf_subject'] = pts[0]['subject_name']
 
+    # This view only renders while active, so its widget state is dropped when
+    # the user switches views; re-seed the subject from the last selected session.
+    if 'wf_subject' not in st.session_state:
+        prev = st.session_state.get('wf_selected_key')
+        if prev and prev['subject_name'] in subjects:
+            st.session_state['wf_subject'] = prev['subject_name']
     subject = st.selectbox('Subject', subjects, index=None, key='wf_subject')
     if not subject:
         return
@@ -116,11 +122,22 @@ def _sessions_params_tab(schema, WfieldParameters, WfieldStack):
         on_select='rerun', selection_mode='single-row', key='wf_sessions_table',
     )
     rows_sel = (event.selection or {}).get('rows', [])
-    if not rows_sel or rows_sel[0] >= len(sessions):
+    row = None
+    if rows_sel and rows_sel[0] < len(sessions):
+        row = sessions.iloc[rows_sel[0]]
+    else:
+        # No row clicked on this run (e.g. the table was re-created after a view
+        # switch): keep the session selected earlier if it belongs to this subject.
+        prev = st.session_state.get('wf_selected_key')
+        if prev and prev['subject_name'] == subject:
+            match = sessions[(sessions['session_name'] == prev['session_name'])
+                             & (sessions['dataset_name'] == prev['dataset_name'])]
+            if not match.empty:
+                row = match.iloc[0]
+    if row is None:
         st.caption('Click a row to select a session. Green rows have completed analyses.')
         return
 
-    row = sessions.iloc[rows_sel[0]]
     sel_key = dict(subject_name=subject,
                    session_name=row['session_name'],
                    dataset_name=row['dataset_name'])

@@ -69,21 +69,21 @@ def _results_tab(schema, WfieldParameters, WfieldStack):
             sel_key['dataset_name'], int(analysis_id))
 
     proj_names = sorted({pn for pn, _ in proj_rows_raw})
-    proj_tabs = st.tabs(['mean_proj'] + proj_names)
-
-    with proj_tabs[0]:
-        arr = _normalize_with_pct(mean_proj.squeeze(), lo_pct, hi_pct)
-        h, w = arr.shape[:2]
-        st.altair_chart(_altair_image(_to_base64(arr), w, h, title='mean projection'),
-                        width='content')
-
-    for tab, pname in zip(proj_tabs[1:], proj_names):
-        with tab:
-            raw = next(p for n, p in proj_rows_raw if n == pname)
-            arr = _normalize_with_pct(raw, lo_pct, hi_pct)
-            h, w = arr.shape[:2]
-            st.altair_chart(_altair_image(_to_base64(arr), w, h, title=pname),
-                            width='content')
+    # Segmented control instead of st.tabs so only the chosen projection is
+    # normalised and PNG-encoded on each rerun.
+    options = ['mean_proj'] + proj_names
+    active = st.segmented_control('projection', options, default='mean_proj',
+                                  selection_mode='single', key='res_active_proj',
+                                  label_visibility='collapsed')
+    if active not in options:   # segmented_control can return None
+        active = 'mean_proj'
+    if active == 'mean_proj':
+        raw, title = mean_proj.squeeze(), 'mean projection'
+    else:
+        raw, title = next(p for n, p in proj_rows_raw if n == active), active
+    arr = _normalize_with_pct(raw, lo_pct, hi_pct)
+    h, w = arr.shape[:2]
+    st.altair_chart(_altair_image(_to_base64(arr), w, h, title=title), width='content')
 
     with st.expander('Motion correction shifts'):
         try:

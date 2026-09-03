@@ -241,15 +241,21 @@ def _atlas_alignment_tab(schema, WfieldParameters, WfieldStack):
         atlas_row      = get_atlas_row(atlas_name)
         imaging_window = get_imaging_window(subject_name, session_name, dataset_name)
 
-    manual_tab, landmarks_tab = st.tabs(['Manual', 'Landmarks'])
-    with manual_tab:
-        _atlas_manual_subtab(sel_key, atlas_name, transform_id,
-                              ref_image, atlas_row, imaging_window,
-                              WidefieldAtlasTransform, get_existing_transforms)
-    with landmarks_tab:
-        _atlas_landmarks_subtab(sel_key, atlas_name, transform_id,
-                                ref_image, atlas_row,
-                                WidefieldAtlasTransform, get_existing_transforms)
+    # Segmented control instead of st.tabs so only the active method's body runs
+    # on each rerun (both render full-size image charts).
+    views = {
+        'Manual': lambda: _atlas_manual_subtab(
+            sel_key, atlas_name, transform_id, ref_image, atlas_row, imaging_window,
+            WidefieldAtlasTransform, get_existing_transforms),
+        'Landmarks': lambda: _atlas_landmarks_subtab(
+            sel_key, atlas_name, transform_id, ref_image, atlas_row,
+            WidefieldAtlasTransform, get_existing_transforms),
+    }
+    default = 'Manual'
+    active = st.segmented_control('method', list(views), default=default,
+                                  selection_mode='single', key='at_active_view',
+                                  label_visibility='collapsed')
+    views.get(active, views[default])()   # segmented_control can return None
 
 
 def _atlas_manual_subtab(sel_key, atlas_name, transform_id,
