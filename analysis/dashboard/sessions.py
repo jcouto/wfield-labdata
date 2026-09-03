@@ -36,12 +36,22 @@ def _sessions_params_tab(schema, WfieldParameters, WfieldStack):
 
     @cache
     def get_subject_counts():
-        rows = (schema.Widefield * schema.Dataset * schema.Session).fetch(
-            'subject_name', as_dict=True)
+        """Per subject: number of widefield recordings, and how many of those
+        already have at least one WfieldParameters row (long format for the
+        grouped bar chart)."""
+        wf = schema.Widefield * schema.Dataset * schema.Session
+        rows = wf.fetch('subject_name', as_dict=True)
         if not rows:
             return pd.DataFrame()
-        df = pd.DataFrame(rows)
-        return df.groupby('subject_name').size().reset_index(name='n_recordings')
+        all_counts = pd.Series([r['subject_name'] for r in rows]).value_counts()
+        with_params = (wf & WfieldParameters.proj()).fetch('subject_name', as_dict=True)
+        param_counts = pd.Series([r['subject_name'] for r in with_params]).value_counts()
+        df = pd.DataFrame({
+            'subject_name': all_counts.index,
+            'Recordings': all_counts.values,
+            'With WfieldParameters': param_counts.reindex(all_counts.index).fillna(0).astype(int).values,
+        })
+        return df.melt(id_vars='subject_name', var_name='kind', value_name='n')
 
     subjects = get_subjects()
     if not subjects:
@@ -50,13 +60,22 @@ def _sessions_params_tab(schema, WfieldParameters, WfieldStack):
 
     bar_data = get_subject_counts()
     if not bar_data.empty:
+        kinds = ['Recordings', 'With WfieldParameters']
         bar = (
-            alt.Chart(bar_data).mark_bar(color='black').encode(
+            alt.Chart(bar_data).mark_bar().encode(
                 x=alt.X('subject_name:N', sort='ascending', title='Subject'),
-                y=alt.Y('n_recordings:Q', title='Recordings'),
-                tooltip=['subject_name:N', 'n_recordings:Q'],
+                xOffset=alt.XOffset('kind:N', sort=kinds),
+                y=alt.Y('n:Q', title='Count'),
+                color=alt.Color('kind:N', title=None,
+                                scale=alt.Scale(domain=kinds, range=['black', '#4c78a8']),
+                                legend=alt.Legend(orient='top')),
+                tooltip=['subject_name:N', 'kind:N', 'n:Q'],
             )
-            .properties(height=180)
+            # Streamlit's default autosize is 'fit', which makes `height` the
+            # total including legend and axis labels; 'fit-x' keeps the width
+            # stretched but makes `height` the plot area.
+            .properties(height=150,
+                        autosize=alt.AutoSizeParams(type='fit-x', contains='padding'))
         )
         click_sel = alt.selection_point(name='subj_click', fields=['subject_name'], on='click')
         bar_event = st.altair_chart(
@@ -242,6 +261,7 @@ def _sessions_params_tab(schema, WfieldParameters, WfieldStack):
                 WfieldParameters.insert1(new_row)
                 get_params.clear()
                 get_sessions.clear()
+                get_subject_counts.clear()
                 get_table_counts.clear()
                 st.success(f'Inserted wfield_analysis_id={analysis_id}.')
                 st.rerun()

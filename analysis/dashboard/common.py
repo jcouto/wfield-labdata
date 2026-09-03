@@ -24,7 +24,10 @@ def _normalize_with_pct(img, lo_pct=2.0, hi_pct=99.0):
     return np.clip(img * 255, 0, 255).astype(np.uint8)
 
 
-def _to_base64(arr):
+def _to_base64(arr, fmt='PNG', **save_kwargs):
+    """Encode an image array as a ``data:`` URL. ``fmt`` is a PIL format name
+    ('PNG' or 'JPEG'); extra keyword arguments go to ``PIL.Image.save`` (e.g.
+    ``quality=90`` for JPEG)."""
     from PIL import Image as PILImage
     arr = np.squeeze(arr)
     if arr.ndim == 3 and arr.shape[2] == 3:
@@ -35,8 +38,9 @@ def _to_base64(arr):
     else:
         arr = np.stack([arr] * 3, axis=-1)
     buf = io.BytesIO()
-    PILImage.fromarray(arr).save(buf, format='PNG')
-    return 'data:image/png;base64,' + base64.b64encode(buf.getvalue()).decode()
+    PILImage.fromarray(arr).save(buf, format=fmt, **save_kwargs)
+    mime = 'jpeg' if fmt.upper() in ('JPEG', 'JPG') else fmt.lower()
+    return f'data:image/{mime};base64,' + base64.b64encode(buf.getvalue()).decode()
 
 
 def _altair_image(url, w, h, title='', width=400, height=None):
