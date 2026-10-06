@@ -999,7 +999,6 @@ class WidefieldAtlasTransform(dj.Manual):
             The projection resampled into widefield-image coordinates.
         """
         from .utils import warp_image
-        _check_hemisphere(hemisphere)
         M_px, atlas_proj = self._atlas_pixel_transform()
         if projection is None:
             projection = atlas_proj

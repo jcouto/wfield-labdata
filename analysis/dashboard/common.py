@@ -2,7 +2,6 @@ import base64
 import io
 import numpy as np
 import pandas as pd
-import streamlit as st
 
 _ANALYSED_COLOR = '#d4f5d4'  # light green for sessions with completed WfieldStack
 
@@ -65,6 +64,8 @@ def _tab_cache_factory(refresh_key):
     per-tab refresh button. When the tab's refresh flag is set (the button was
     clicked on the previous run), each cache is cleared as it is recreated — so
     only the current tab's data reloads, leaving other tabs' caches warm."""
+    import streamlit as st
+
     do_clear = st.session_state.pop(refresh_key, False)
 
     def cache(func):
@@ -77,6 +78,8 @@ def _tab_cache_factory(refresh_key):
 
 def _refresh_button(refresh_key, label='↻ Refresh'):
     """Render a per-tab refresh button that reloads this tab's data on next run."""
+    import streamlit as st
+
     if st.button(label, key=f'{refresh_key}_btn',
                  help="Reload this tab's data from the database"):
         st.session_state[refresh_key] = True
@@ -174,6 +177,8 @@ SCHEMA_REFERENCE = {
 
 def _schema_reference(*names):
     """Render a collapsed quick-reference of the given pluginschema classes."""
+    import streamlit as st
+
     with st.expander('Schema reference (pluginschema)'):
         for name in names:
             entry = SCHEMA_REFERENCE.get(name)
