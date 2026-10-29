@@ -935,6 +935,161 @@ class WidefieldAtlasTransform(dj.Manual):
         mp = np.squeeze(np.asarray(mp)).astype(float)
         return mp[0] if mp.ndim == 3 else mp   # mean_proj is channel-first
 
+    # ------------------------------------------------------------------
+    # Carrying a transform to another session of the same animal
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _registration_image(key, image=None, mask=None, analysis_id=None):
+        """Image and mask used to register a widefield session.
+
+        The image defaults to the WfieldStack mean projection (lowest
+        ``wfield_analysis_id`` unless ``analysis_id`` is given). The mask
+        defaults to the ImagingWindow circle of the same dataset, else of any
+        dataset in the same session (windows are shared within a session), else
+        a data-driven mask of the illuminated window (`auto_brain_mask`).
+        Returns ``(image, mask, mask_source)``.
+        """
+        from .utils import circle_mask, auto_brain_mask
+        wkey = dict(subject_name=key['subject_name'], session_name=key['session_name'],
+                    dataset_name=key['dataset_name'])
+        if image is None:
+            aids = (WfieldStack & wkey).fetch('wfield_analysis_id')
+            if not len(aids):
+                raise ValueError(f'No WfieldStack mean projection for {wkey}; pass the image.')
+            aid = int(min(aids)) if analysis_id is None else int(analysis_id)
+            mp = np.squeeze(np.asarray((WfieldStack & dict(wkey, wfield_analysis_id=aid)
+                                        ).fetch1('mean_proj'))).astype(float)
+            image = mp[0] if mp.ndim == 3 else mp
+        image = np.squeeze(np.asarray(image, dtype=float))
+        if image.ndim == 3:
+            image = image[0]
+        if mask is not None:
+            return image, np.asarray(mask, bool), 'given'
+        for restr, src in ((wkey, 'window'),
+                           (dict(subject_name=wkey['subject_name'],
+                                 session_name=wkey['session_name']), 'window (other dataset)')):
+            rows = (ImagingWindow & restr).fetch('circle_parameters', 'dataset_name', as_dict=True)
+            if rows:
+                circle = np.asarray(rows[0]['circle_parameters'], dtype=float).ravel()
+                return image, circle_mask(image.shape, circle), src
+        return image, auto_brain_mask(image), 'auto'
+
+    def infer_from_existing(self, target_key, source=None, atlas_transform_id=None,
+                            target_image=None, source_image=None,
+                            target_mask=None, source_mask=None, insert=False,
+                            **registration_kwargs):
+        """Infer the atlas transform of another widefield session of the same
+        animal by registering its image to the session of an existing transform.
+
+        The source image (the session that already has a transform) is
+        registered onto the target image with a similarity transform
+        (`register_similarity`: isotropic scale, rotation and translation, so a
+        different magnification or binning is handled). The new atlas transform
+        is the composition ``S @ M_source``; it is stored as a ``'manual'``
+        transform with the equivalent bregma / resolution / rotation parameters
+        (``scale``, ``ratio`` and ``mirror`` are copied; the magnification change
+        goes into ``resolution``), plus the exact ``transform_matrix``.
+
+        Parameters
+        ----------
+        target_key : dict
+            ``subject_name``, ``session_name``, ``dataset_name`` of the widefield
+            dataset to infer the transform for.
+        source : restriction, optional
+            The existing WidefieldAtlasTransform to start from. Defaults to
+            ``self``, which must then hold exactly one row.
+        atlas_transform_id : int, optional
+            Id of the new transform (default: the source's id).
+        target_image, source_image : 2-D arrays, optional
+            Images to register (default: WfieldStack mean projections).
+        target_mask, source_mask : bool arrays, optional
+            Pixels to use (default: ImagingWindow circle, else an automatic mask).
+        insert : bool
+            Insert the new row (``replace=True``). Default False: only return it.
+        **registration_kwargs
+            Forwarded to `register_similarity` (e.g. ``scales``, ``angles``).
+
+        Returns
+        -------
+        row : dict
+            The new WidefieldAtlasTransform row (inserted when ``insert``).
+        info : dict
+            Registration diagnostics: ``ncc`` (masked normalised cross
+            correlation after high-pass filtering; above ~0.5 is a confident
+            match for same-magnification sessions), ``scale``, ``rotation``,
+            ``translation``, ``matrix`` (source px -> target px), the images
+            and masks used, and the source key.
+
+        Notes
+        -----
+        Inspect the result before trusting it: ``info['matrix']`` warps the
+        source image onto the target (``warp_image(info['source_image'],
+        info['matrix'], target.shape)``) and ``WidefieldAtlasTransform(...)
+        .plot_regions`` shows the inferred contours. Sessions acquired with a
+        different magnification that covers only part of the window register
+        poorly (few vessels, dust spots on the sensor); use the landmark tool
+        for those.
+        """
+        from .utils import register_similarity, decompose_similarity
+        src = self if source is None else (WidefieldAtlasTransform & source)
+        if len(src) != 1:
+            raise ValueError(f'The source must be exactly one WidefieldAtlasTransform row, got {len(src)}.')
+        src_row = src.fetch1()
+        src_key = {k: src_row[k] for k in ('subject_name', 'session_name', 'dataset_name')}
+        target_key = {k: target_key[k] for k in ('subject_name', 'session_name', 'dataset_name')}
+        if target_key['subject_name'] != src_key['subject_name']:
+            raise ValueError('Source and target must be sessions of the same subject '
+                             f"({src_key['subject_name']} vs {target_key['subject_name']}).")
+
+        src_img, src_m, src_msrc = self._registration_image(src_key, source_image, source_mask)
+        dst_img, dst_m, dst_msrc = self._registration_image(target_key, target_image, target_mask)
+        S, reg = register_similarity(src_img, dst_img, src_m, dst_m, **registration_kwargs)
+
+        M_src = np.asarray(src.get_transform(), dtype=float)
+        M_new = S @ M_src
+        s, rot_s, _, _ = decompose_similarity(S)
+        bregma = M_new @ np.array([0., 0., 1.])
+        if src_row['transform_type'] == 'manual':
+            resolution = float(src_row['resolution']) / s
+            rotation = float(src_row['rotation'] or 0.) + rot_s
+            scale = float(src_row['scale'] or 1.)
+            ratio = float(src_row['ratio'] or 1.)
+            mirror = int(src_row.get('mirror') or 0)
+        else:
+            # landmark transform: closest manual parametrisation of M_new;
+            # the stored transform_matrix keeps the exact result
+            A = M_new[:2, :2]
+            mirror = int(np.linalg.det(A) < 0)
+            sx = np.hypot(A[0, 0], A[1, 0])
+            sy = np.hypot(A[0, 1], A[1, 1])
+            rotation = float(np.degrees(np.arctan2(A[1, 0], A[0, 0])))
+            if mirror:
+                rotation = float(np.degrees(np.arctan2(-A[1, 0], -A[0, 0])))
+            resolution = 1. / sy
+            scale = 1.
+            ratio = float(sx / sy)
+        rotation = float((rotation + 180.) % 360. - 180.)
+        row = dict(target_key,
+                   atlas_name=src_row['atlas_name'],
+                   atlas_transform_id=int(src_row['atlas_transform_id']
+                                          if atlas_transform_id is None else atlas_transform_id),
+                   transform_type='manual',
+                   reference_point=[float(bregma[0]), float(bregma[1])],
+                   resolution=float(resolution),
+                   rotation=float(rotation),
+                   scale=float(scale),
+                   ratio=float(ratio),
+                   mirror=int(mirror),
+                   transform_matrix=M_new,
+                   transform_matrix_inverse=np.linalg.inv(M_new))
+        info = dict(reg, matrix=S, source_key=dict(src_key, atlas_name=src_row['atlas_name'],
+                                                      atlas_transform_id=src_row['atlas_transform_id']),
+                    source_image=src_img, source_mask=src_m, source_mask_from=src_msrc,
+                    target_image=dst_img, target_mask=dst_m, target_mask_from=dst_msrc)
+        if insert:
+            self.insert1(row, replace=True)
+        return row, info
+
     def image_to_atlas(self, image, output_shape=None, hemisphere='both', **kwargs):
         """Warp a widefield image into atlas-projection pixel space.
 

@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from .common import _ANALYSED_COLOR, _tab_cache_factory, _refresh_button
+from .common import _ANALYSED_COLOR, _ATLAS_COLOR, _tab_cache_factory, _refresh_button
 
 
 def _sessions_params_tab(schema, WfieldParameters, WfieldStack):
@@ -96,6 +96,7 @@ def _sessions_params_tab(schema, WfieldParameters, WfieldStack):
 
     @cache
     def get_sessions(subject_name):
+        from ..pluginschema import WidefieldAtlasTransform
         rows = (schema.Widefield * schema.Dataset * schema.Session
                 & dict(subject_name=subject_name)).fetch(
             'session_name', 'dataset_name', 'n_channels', 'n_frames', 'frame_rate',
@@ -103,15 +104,17 @@ def _sessions_params_tab(schema, WfieldParameters, WfieldStack):
         if not rows:
             return pd.DataFrame()
         df = pd.DataFrame(rows)
-        param_counts, stack_counts = [], []
+        param_counts, stack_counts, atlas_counts = [], [], []
         for r in rows:
             wkey = dict(subject_name=subject_name,
                         session_name=r['session_name'],
                         dataset_name=r['dataset_name'])
             param_counts.append(len(WfieldParameters & wkey))
             stack_counts.append(len(WfieldStack & wkey))
+            atlas_counts.append(len(WidefieldAtlasTransform & wkey))
         df['n_params'] = param_counts
         df['n_stacks'] = stack_counts
+        df['n_atlas'] = atlas_counts
         # other datasets in the same session
         all_ds = (schema.Dataset & dict(subject_name=subject_name)).fetch(
             'session_name', 'dataset_name', as_dict=True)
@@ -131,7 +134,14 @@ def _sessions_params_tab(schema, WfieldParameters, WfieldStack):
         return
 
     def _highlight_analysed(row):
-        color = _ANALYSED_COLOR if row['n_stacks'] > 0 else ''
+        # two shades of green: analysed (WfieldStack) and, darker, also
+        # registered to the atlas (WidefieldAtlasTransform)
+        if row['n_atlas'] > 0:
+            color = _ATLAS_COLOR
+        elif row['n_stacks'] > 0:
+            color = _ANALYSED_COLOR
+        else:
+            color = ''
         return [f'background-color: {color}'] * len(row)
 
     styled = sessions.style.apply(_highlight_analysed, axis=1)
@@ -154,7 +164,8 @@ def _sessions_params_tab(schema, WfieldParameters, WfieldStack):
             if not match.empty:
                 row = match.iloc[0]
     if row is None:
-        st.caption('Click a row to select a session. Green rows have completed analyses.')
+        st.caption('Click a row to select a session. Light green rows have completed analyses; '
+                   'dark green rows also have an atlas transform.')
         return
 
     sel_key = dict(subject_name=subject,

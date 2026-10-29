@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 
 _ANALYSED_COLOR = '#d4f5d4'  # light green for sessions with completed WfieldStack
+_ATLAS_COLOR = '#8fd68f'     # darker green: also has a WidefieldAtlasTransform
 
 
 def _normalize_image(img):
@@ -152,7 +153,15 @@ SCHEMA_REFERENCE = {
          'transform_regions(ccf_regions=None)': 'region contours warped to widefield pixels',
          'plot_regions(acronyms=None, ax=None, labels=True, **kw)':
             'plot warped region contours on the image',
-         'load_reference()': 'return the atlas (ccf_regions, projection, outline)'},
+         'load_reference()': 'return the atlas (ccf_regions, projection, outline)',
+         'infer_from_existing(target_key, source=None, insert=False, ...)':
+            'register another session of the same animal to this transform\'s session '
+            '(similarity: scale, rotation, shift) and return its composed transform row + '
+            'diagnostics; `insert=True` saves it',
+         'image_to_atlas(image, output_shape=None, hemisphere="both")':
+            'warp a widefield image or movie into atlas-projection pixels',
+         'atlas_to_image(projection=None, output_shape=None)':
+            'warp the atlas projection into widefield pixels'},
         {},
     ),
     'WidefieldResponse': (

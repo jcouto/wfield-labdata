@@ -184,6 +184,16 @@ def _atlas_alignment_tab(schema, WfieldParameters, WfieldStack):
         )).fetch(as_dict=True)
 
     @cache
+    def get_subject_transforms(subject_name, atlas_name):
+        """Every transform of this subject for the atlas (candidates to infer from)."""
+        rows = (WidefieldAtlasTransform & dict(subject_name=subject_name,
+                                               atlas_name=atlas_name)).fetch(
+            'session_name', 'dataset_name', 'atlas_transform_id', 'transform_type',
+            'resolution', 'rotation', as_dict=True)
+        return sorted(rows, key=lambda r: (r['session_name'], r['dataset_name'],
+                                           r['atlas_transform_id']))
+
+    @cache
     def get_imaging_window(subject_name, session_name, dataset_name):
         from ..pluginschema import ImagingWindow
         rows = (ImagingWindow & dict(subject_name=subject_name,
@@ -250,6 +260,10 @@ def _atlas_alignment_tab(schema, WfieldParameters, WfieldStack):
         'Landmarks': lambda: _atlas_landmarks_subtab(
             sel_key, atlas_name, transform_id, ref_image, atlas_row,
             WidefieldAtlasTransform, get_existing_transforms),
+        'Infer from existing': lambda: _atlas_infer_subtab(
+            sel_key, atlas_name, transform_id, ref_image, atlas_row, imaging_window,
+            stack_ids, analysis_id, WidefieldAtlasTransform,
+            get_existing_transforms, get_subject_transforms, get_mean_proj_at),
     }
     default = 'Manual'
     active = st.segmented_control('method', list(views), default=default,
@@ -522,3 +536,169 @@ def _atlas_landmarks_subtab(sel_key, atlas_name, transform_id,
 
     except Exception as exc:
         st.error(f'Transform preview failed: {exc}')
+
+
+def _render_registration_check(target, warped_source, mask=None):
+    """Red/cyan overlay of the target (red) and the registered source (cyan):
+    well-registered vessels look grey, misregistered ones show colour fringes."""
+    t = _normalize_with_pct(np.nan_to_num(target)).astype(float)
+    w = _normalize_with_pct(np.nan_to_num(warped_source)).astype(float)
+    if mask is not None:
+        t = t * mask; w = w * mask
+    rgb = np.stack([t, w, w], axis=-1).clip(0, 255).astype(np.uint8)
+    from .common import _to_base64
+    return _to_base64(rgb)
+
+
+def _atlas_infer_subtab(sel_key, atlas_name, transform_id, ref_image, atlas_row,
+                        imaging_window, stack_ids, analysis_id,
+                        WidefieldAtlasTransform, get_existing_transforms,
+                        get_subject_transforms, get_mean_proj_at):
+    """Infer this session's transform by registering it to another session of
+    the same animal that already has one (`WidefieldAtlasTransform.infer_from_existing`)."""
+    from ..utils import warp_image, auto_brain_mask
+
+    subject_name = sel_key['subject_name']
+    session_name = sel_key['session_name']
+    dataset_name = sel_key['dataset_name']
+    scope = f'{subject_name}|{session_name}|{dataset_name}|{atlas_name}|{transform_id}'
+    result_key = f'at_i_{scope}_result'
+
+    candidates = [r for r in get_subject_transforms(subject_name, atlas_name)
+                  if not (r['session_name'] == session_name and r['dataset_name'] == dataset_name)]
+    if not candidates:
+        st.info(f'No other WidefieldAtlasTransform for {subject_name} / {atlas_name} to infer from. '
+                'Register one session with the Manual or Landmarks tool first.')
+        return
+    if not stack_ids:
+        st.info('The registration uses the WfieldStack mean projection; run a WfieldStack '
+                'analysis for this session first.')
+        return
+
+    def _label(r):
+        return (f"{r['session_name']} / {r['dataset_name']}  (id {r['atlas_transform_id']}, "
+                f"{r['transform_type']}, {r['resolution'] or float('nan'):.4f} mm/px, "
+                f"{r['rotation'] or 0.:.1f}°)")
+    # default to the most recent session before this one (same rig configuration is likely)
+    before = [i for i, r in enumerate(candidates) if r['session_name'] < session_name]
+    default_idx = before[-1] if before else len(candidates) - 1
+    sel = st.selectbox('Infer from', range(len(candidates)), index=default_idx,
+                       format_func=lambda i: _label(candidates[i]), key=f'at_i_{scope}_src')
+    src = candidates[sel]
+    src_key = dict(subject_name=subject_name, session_name=src['session_name'],
+                   dataset_name=src['dataset_name'], atlas_name=atlas_name,
+                   atlas_transform_id=src['atlas_transform_id'])
+
+    with st.expander('Registration options'):
+        oc1, oc2, oc3 = st.columns(3)
+        s_lo, s_hi = oc1.slider('Scale range (source px → this px)', 0.2, 5.0, (0.4, 3.0),
+                                step=0.1, key=f'at_i_{scope}_scales',
+                                help='0.5 = this session is binned 2x relative to the source; '
+                                     '>1 = this session is zoomed in.')
+        max_ang = oc2.slider('Rotation search (±°)', 5, 90, 25, step=5, key=f'at_i_{scope}_ang')
+        n_starts = oc3.number_input('Starts refined', 1, 10, 3, key=f'at_i_{scope}_starts')
+        force_auto = st.checkbox('Ignore ImagingWindow masks (use automatic brain masks)',
+                                 value=False, key=f'at_i_{scope}_auto',
+                                 help='By default the ImagingWindow circle of each session '
+                                      '(or of another dataset of the same session) masks the '
+                                      'image; without one an Otsu mask of the window is used.')
+        st.caption('The source image is high-pass filtered and registered to this session\'s '
+                   'mean projection with a similarity transform (scale, rotation, shift); '
+                   'the atlas transform is composed with it. Check the overlay before saving.')
+
+    if st.button('Infer from existing', type='primary', key=f'at_i_{scope}_run'):
+        with st.spinner('Registering images… (about a minute)'):
+            try:
+                target_image = get_mean_proj_at(subject_name, session_name, dataset_name,
+                                                int(analysis_id))
+                kw = dict(target_image=target_image,
+                          scales=np.geomspace(s_lo, s_hi, max(5, int(np.log(s_hi / s_lo) / np.log(1.05)) + 1)),
+                          angles=np.arange(-max_ang, max_ang + 0.1, 2.5),
+                          n_starts=int(n_starts))
+                if force_auto:
+                    src_img = WidefieldAtlasTransform._registration_image(src_key)[0]
+                    kw.update(source_image=src_img, source_mask=auto_brain_mask(src_img),
+                              target_mask=auto_brain_mask(target_image))
+                row, info = WidefieldAtlasTransform().infer_from_existing(
+                    sel_key, source=src_key, atlas_transform_id=transform_id, **kw)
+                st.session_state[result_key] = (row, info)
+            except Exception as exc:
+                st.session_state.pop(result_key, None)
+                st.error(f'Registration failed: {exc}')
+
+    if result_key not in st.session_state:
+        return
+    row, info = st.session_state[result_key]
+    if info['source_key'] != src_key:
+        st.caption('Result below is for a different source; press *Infer from existing* to redo.')
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric('NCC (match quality)', f"{info['ncc']:.3f}",
+              help='Masked normalised cross-correlation of the high-passed images. '
+                   'Above ~0.5 is a confident match for same-magnification sessions; '
+                   'below ~0.3 inspect the overlay carefully.')
+    m2.metric('Scale (source → this)', f"{info['scale']:.3f}")
+    m3.metric('Rotation (°)', f"{info['rotation']:.2f}")
+    m4.metric('Shift (px)', f"{info['translation'][0]:.1f}, {info['translation'][1]:.1f}")
+    rp = row['reference_point']
+    st.write(f"Inferred: bregma ({rp[0]:.1f}, {rp[1]:.1f}) px · resolution {row['resolution']:.5f} mm/px · "
+             f"rotation {row['rotation']:.2f}° · scale {row['scale']:.3f} · ratio {row['ratio']:.3f} · "
+             f"mirror {row['mirror']}  —  masks: source {info['source_mask_from']}, "
+             f"this {info['target_mask_from']}")
+
+    target = info['target_image']
+    img_h, img_w = target.shape[:2]
+    warped = warp_image(info['source_image'], info['matrix'], target.shape)
+    warped_mask = warp_image(info['source_mask'].astype(float), info['matrix'], target.shape) > 0.5
+    pc1, pc2, pc3 = st.columns(3)
+    with pc1:
+        st.caption(f"Source: {src['session_name']}")
+        srow = (WidefieldAtlasTransform & src_key).fetch1()
+        from ..utils import decompose_similarity
+        Ms = (WidefieldAtlasTransform & src_key).get_transform()
+        s_scale, s_rot, s_tx, s_ty = decompose_similarity(Ms)
+        if srow['transform_type'] == 'manual':
+            url = _render_atlas_overlay(info['source_image'], atlas_row['ccf_regions'],
+                                        np.asarray(srow['reference_point']).ravel(),
+                                        srow['resolution'], srow['rotation'] or 0.,
+                                        srow['scale'] or 1., srow['ratio'] or 1.,
+                                        mirror=bool(srow.get('mirror') or 0))
+        else:
+            url = _render_img_with_landmarks(info['source_image'], [])
+        sh, sw = info['source_image'].shape[:2]
+        st.altair_chart(_altair_image(url, sw, sh, title='Source + its atlas', width=300),
+                        width='content')
+    with pc2:
+        st.caption('This session + inferred atlas')
+        url = _render_atlas_overlay(ref_image, atlas_row['ccf_regions'], rp, row['resolution'],
+                                    row['rotation'], row['scale'], row['ratio'],
+                                    mirror=bool(row['mirror']))
+        st.altair_chart(_altair_image(url, img_w, img_h, title='Inferred transform', width=300),
+                        width='content')
+    with pc3:
+        st.caption('Registration check: this session (red) vs registered source (cyan)')
+        url = _render_registration_check(target, warped, warped_mask & info['target_mask'])
+        st.altair_chart(_altair_image(url, img_w, img_h, title='Grey = aligned vessels', width=300),
+                        width='content')
+
+    bc1, bc2 = st.columns(2)
+    if bc1.button(f'Save as transform id {transform_id}', type='primary', key=f'at_i_{scope}_save'):
+        row = dict(row, atlas_transform_id=int(transform_id))
+        WidefieldAtlasTransform.insert1(row, replace=True)
+        get_existing_transforms.clear()
+        get_subject_transforms.clear()
+        st.success(f'Saved inferred transform id={transform_id} for {session_name} / {dataset_name}.')
+        st.rerun(scope='fragment')
+    if bc2.button('Edit in Manual', key=f'at_i_{scope}_edit',
+                  help='Load the inferred parameters into the Manual sliders to adjust them'):
+        mscope = scope
+        st.session_state[f'at_m_{mscope}_rx'] = float(rp[0])
+        st.session_state[f'at_m_{mscope}_ry'] = float(rp[1])
+        st.session_state[f'at_m_{mscope}_rot'] = float(row['rotation'])
+        st.session_state[f'at_m_{mscope}_scale'] = float(row['scale'])
+        st.session_state[f'at_m_{mscope}_ratio'] = float(row['ratio'])
+        st.session_state[f'at_m_{mscope}_res'] = float(row['resolution'])
+        st.session_state[f'at_m_{mscope}_mirror'] = bool(row['mirror'])
+        st.session_state[f'at_m_{mscope}_init'] = True
+        st.session_state['at_active_view'] = 'Manual'
+        st.rerun(scope='fragment')
