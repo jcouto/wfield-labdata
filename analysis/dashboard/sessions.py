@@ -196,7 +196,7 @@ def _sessions_params_tab(schema, WfieldParameters, WfieldStack):
             dataset_name=dataset_name,
         )).fetch('wfield_analysis_id'))
         df['populated'] = df['wfield_analysis_id'].isin(stack_ids)
-        display_cols = ['wfield_analysis_id', 'motion_correction', 'motion_conv_kernel',
+        display_cols = ['wfield_analysis_id', 'backend', 'motion_correction', 'motion_conv_kernel',
                         'decomposition', 'k', 'atlas', 'functional_channel',
                         'mask_std_threshold', 'populated']
         return df[[c for c in display_cols if c in df.columns]]
@@ -237,6 +237,8 @@ def _sessions_params_tab(schema, WfieldParameters, WfieldStack):
     with st.expander('Add WfieldParameters', expanded=existing.empty):
         col1, col2 = st.columns(2)
         analysis_id   = col1.number_input('wfield_analysis_id', value=next_id, step=1, min_value=0)
+        backend       = col1.selectbox('backend', ['wfield', 'cids'],
+                                       help='library that runs the analysis')
         motion_corr   = col1.selectbox('motion_correction', ['ecc', '2d', 'normcorr', 'none'])
         decomposition = col1.selectbox('decomposition', ['approx', 'pmd'])
         atlas         = col1.text_input('atlas', value='dorsal_cortex')
@@ -268,6 +270,12 @@ def _sessions_params_tab(schema, WfieldParameters, WfieldStack):
                 new_row['mask_std_threshold'] = int(mask_thresh)
             if conv_k0 != 0.0 or conv_k1 != 0.0:
                 new_row['motion_conv_kernel'] = np.array([conv_k0, conv_k1])
+            if 'backend' in WfieldParameters.heading.names:
+                new_row['backend'] = backend
+            elif backend != 'wfield':
+                st.error('WfieldParameters has no backend column yet: run '
+                         '`WfieldParameters.alter()` once to add it.')
+                st.stop()
             try:
                 WfieldParameters.insert1(new_row)
                 get_params.clear()

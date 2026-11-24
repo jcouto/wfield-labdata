@@ -93,13 +93,14 @@ def _refresh_button(refresh_key, label='↻ Refresh'):
 SCHEMA_REFERENCE = {
     'WfieldParameters': (
         'Manual — analysis parameters for a widefield recording; one row per '
-        '`wfield_analysis_id` (motion correction, SVD `k`, masks, atlas).',
+        '`wfield_analysis_id` (backend wfield or cids, motion correction, SVD `k`, masks, atlas).',
         {'create_exclude_mask(widefieldkey)': 'stub for interactively building an exclude mask'},
         {},
     ),
     'WfieldStack': (
-        'Computed — motion correction + SVD decomposition for a WfieldParameters set; '
-        'run with `.populate()`. Stores U / SVT / mean_proj in an AnalysisFile.',
+        'Computed — motion correction + SVD decomposition for a WfieldParameters set, '
+        'with wfield or cids (`backend`); run with `.populate()`. Stores U / SVT / mean_proj '
+        'in an AnalysisFile.',
         {'open(key=None, use_corrected=True)': 'return an SVDStack (reconstructs frames on demand)',
          'load(key=None)': 'load the raw .npz arrays',
          'save_projection(proj, proj_name, key=None)': 'store a 2D projection',

@@ -9,6 +9,10 @@ __all__ = ['WfieldParameters', 'WfieldStack', 'ImagingWindow',
 
 userschema = get_user_schema()
 
+# containers/labdata-wfield.sdef: labdata, wfield and cids (the plugin itself is sent
+# with `labdata run ... --plugins pwfield`)
+CONTAINER = 'labdata-wfield'
+
 
 def _check_hemisphere(hemisphere):
     if hemisphere not in ('both', 'left', 'right'):
@@ -22,6 +26,7 @@ class WfieldParameters(dj.Manual):
     -> Widefield
     wfield_analysis_id : int
     ---
+    backend = 'wfield'           : enum('wfield','cids')                 # library that runs the analysis
     motion_correction = 'ecc'    : enum('2d','ecc','normcorr','none')    # type of motion correction
     motion_conv_kernel = NULL    : blob                                  # convolution kernel for motion correction
     decomposition = 'approx'     : enum('approx','pmd')                  # type of decomposition algorithm
@@ -43,6 +48,22 @@ class WfieldParameters(dj.Manual):
     
 @userschema
 class WfieldStack(dj.Computed):
+    '''Motion correction, SVD and hemodynamic correction of a widefield recording.
+
+    ``WfieldParameters.backend`` chooses the library: ``'wfield'`` (default) or
+    ``'cids'`` (``cids.widefield.run_widefield``). Both store the same arrays
+    (``U``, ``SVT``, ``SVTcorr``, ``motion``, ``mean_proj``) in the .npz, so
+    ``open()`` and ``load()`` work the same; cids adds the rest of its results
+    (``shifts``, ``baseline``, ``mask``, ``hemo_coefficients``, ``qc_*``, ...)
+    and its settings as JSON (``cids_attrs``).
+
+    ``labdata run populate`` runs it in the ``labdata-wfield`` container with
+    a GPU (``cuda``), with the options of the remote for the ``cids``
+    analysis (``name``, e.g. a GPU queue), as ``CidsCompute``.
+    '''
+    default_container = CONTAINER
+    cuda = True     # cids runs on the GPU when the job has one; wfield does not use it
+    name = 'cids'   # the job uses the options of the remote for the cids analysis (the queue)
     definition = '''
     -> WfieldParameters
     ---
@@ -60,24 +81,72 @@ class WfieldStack(dj.Computed):
         '''
 
     def make(self, key):
-        from wfield import (motion_correct, get_std_mask,
-                            chunk_indices, approximate_svd,
-                            hemodynamic_correction, SVDStack)
         import string
+        from shutil import rmtree
         par = (WfieldParameters() & key).fetch1()
-        
-        try:
-            dat = (Widefield & key).open()
-        except ValueError:
-            # try tif files
-            files = (File & (Dataset.DataFiles & (Dataset & (Widefield & key)) & 'file_path LIKE "%.tif"' & 'file_path NOT LIKE "%ref%"')).get()
-            if len(files):
-                from wfield import TiffStack
-                dat = TiffStack(natsorted([str(f) for f in files]),nchannels = (Widefield & key).fetch1('n_channels'))
+        backend = par.get('backend') or 'wfield'   # rows read before the backend column was added
+        if backend not in ('wfield', 'cids'):
+            raise ValueError(f"backend is 'wfield' or 'cids', not {backend!r}")
+        dat = self._open_movie(key)
+        fs, nchannels = (Widefield & key).fetch1('frame_rate', 'n_channels')
         # work in the scratch folder
         rand = ''.join(np.random.choice([s for s in string.ascii_lowercase + string.digits],9))
         scratch_folder = Path(prefs['scratch_path'])/f'wfield_{rand}'
         scratch_folder.mkdir(exist_ok = True)
+        try:
+            if backend == 'cids':
+                wfield_ins, projections, explained_variance = self._make_cids(
+                    dat, par, nchannels, fs, scratch_folder)
+            else:
+                wfield_ins, projections, explained_variance = self._make_wfield(
+                    dat, par, nchannels, fs, scratch_folder)
+            # store the results
+            dataset = dict(**key)
+            dataset['dataset_name'] = f'{key["dataset_name"]}_wfield_{par["wfield_analysis_id"]:02d}'
+            from labdata.schema import AnalysisFile
+            resultsfolder = AnalysisFile().generate_filepaths([''],dataset)
+            resultsfolder = Path(prefs['local_paths'][0])/resultsfolder[0]
+            resultsfolder.mkdir(exist_ok=True,parents=True)
+            resultspath = resultsfolder/'wfield_res.npz'
+            np.savez(resultspath,**wfield_ins)
+            # upload to aws
+            filekeys = AnalysisFile().upload_files([resultspath],dataset)
+            # store on database
+            key = dict(key,
+                       **filekeys[0],
+                       motion_correction = wfield_ins['motion'],
+                       mean_proj = wfield_ins['mean_proj'].squeeze(),
+                       explained_variance = explained_variance)
+            # insert results
+            self.insert1(key)
+            # insert projections
+            self.Projection.insert([dict(key, proj_name=name, proj=proj)
+                                     for name, proj in projections],ignore_extra_fields=True)
+        finally:
+            # remove the temporary data
+            rmtree(scratch_folder, ignore_errors=True)
+
+    @staticmethod
+    def _open_movie(key):
+        '''The raw movie (frames, channels, height, width): the zarr of the
+        Widefield entry, or its .tif files.'''
+        try:
+            return (Widefield & key).open()
+        except ValueError:
+            # try tif files
+            files = (File & (Dataset.DataFiles & (Dataset & (Widefield & key)) & 'file_path LIKE "%.tif"' & 'file_path NOT LIKE "%ref%"')).get()
+            if not len(files):
+                raise
+            from wfield import TiffStack
+            return TiffStack(natsorted([str(f) for f in files]),nchannels = (Widefield & key).fetch1('n_channels'))
+
+    @staticmethod
+    def _make_wfield(dat, par, nchannels, fs, scratch_folder):
+        '''Motion correction, SVD and hemodynamic correction with wfield (one
+        coefficient per pixel, 0.1 Hz to fs/2 - 2).'''
+        from wfield import (motion_correct, get_std_mask,
+                            chunk_indices, approximate_svd,
+                            hemodynamic_correction, SVDStack)
         motion = scratch_folder/'temporary.motion.bin'
         out = np.memmap(motion,mode = 'w+',dtype = np.uint16, shape = dat.shape)
         (yshifts,xshifts),rshifts = motion_correct(dat,
@@ -92,21 +161,18 @@ class WfieldStack(dj.Computed):
         for on,off in tqdm(chunkidx,desc = 'Computing the average of the frames'):
             frame_averages.append(out[on:off].mean(axis=0))
         frames_average = np.stack(frame_averages).mean(axis = 0)
-        functional_channel = par['functional_channel']
         mask = np.ones(out.shape[-2::],dtype=bool)
         if not par['exclude_mask'] is None:
             mask = par['exclude_mask'].copy() == 0
-        if not par['mask_std_threshold'] is None: 
+        if not par['mask_std_threshold'] is None:
             mask = mask & get_std_mask(out[:,par['functional_channel']],
                             threshold = par['mask_std_threshold']).astype(bool)
-        U,SVT = approximate_svd(out, frames_average, 
-                                onsets = None, 
+        U,SVT = approximate_svd(out, frames_average,
+                                onsets = None,
                                 mask = mask, k = par['k'],
                                 nframes_per_bin = par['nframes_decimate'])
-        fs = (Widefield & key).fetch1('frame_rate')
         freq_lowpass = fs/2 - 2
         freq_highpass = 0.1
-        nchannels = (Widefield & key).fetch1('n_channels')
         wfield_ins = dict(motion = np.stack([xshifts,yshifts,rshifts]).transpose(0,2,1).astype('float32'),
                           mean_proj = frames_average.astype('uint16'),
                           SVT = SVT,
@@ -128,30 +194,42 @@ class WfieldStack(dj.Computed):
         projections = [
             ('var',  svd_stack.var()),
         ]
-        # store the results
-        dataset = dict(**key)
-        dataset['dataset_name'] = f'{key["dataset_name"]}_wfield_{par["wfield_analysis_id"]:02d}'
-        from labdata.schema import AnalysisFile 
-        resultsfolder = AnalysisFile().generate_filepaths([''],dataset)
-        resultsfolder = Path(prefs['local_paths'][0])/resultsfolder[0]
-        resultsfolder.mkdir(exist_ok=True,parents=True)
-        resultspath = resultsfolder/'wfield_res.npz'
-        np.savez(resultspath,**wfield_ins)
-        # upload to aws
-        filekeys = AnalysisFile().upload_files([resultspath],dataset)
-        # store on database
-        key = dict(key,
-                   **filekeys[0],
-                   motion_correction = np.stack([xshifts,yshifts,rshifts]).transpose(0,2,1).astype('float32'),
-                   mean_proj = frames_average.astype('uint16').squeeze())
-        # insert results
-        self.insert1(key)
-        # insert projections
-        self.Projection.insert([dict(key, proj_name=name, proj=proj)
-                                 for name, proj in projections],ignore_extra_fields=True)
-        # remove the temporary data
-        from shutil import rmtree
-        rmtree(scratch_folder)
+        return wfield_ins, projections, None
+
+    @staticmethod
+    def _make_cids(dat, par, nchannels, fs, scratch_folder):
+        '''Registration, dF/F, compression and hemodynamic correction with cids
+        (``cids.widefield.run_widefield``, device 'auto'), stored like the
+        wfield results.
+
+        From WfieldParameters: ``k``, ``functional_channel`` (the isosbestic
+        is the next channel), ``chunk_size``, ``exclude_mask`` and
+        ``mask_std_threshold`` (cids' ``activity_mask`` threshold); every
+        ``motion_correction`` but ``'none'`` is cids' rigid registration with
+        rotation. ``decomposition``: ``'approx'`` is cids' SVD (``k``
+        components); ``'pmd'`` its local low-rank denoising, re-compressed
+        over the frame (``cids.widefield.recompress``) into one dense U.
+        The hemodynamic correction is cids' regression by frequency band.
+        ``motion_conv_kernel`` and ``nframes_decimate`` are wfield's only.
+        '''
+        from .utils import cids_widefield, svd_variance
+        decomposition = {'approx': 'svd', 'pmd': 'local'}[par['decomposition']]
+        functional = int(par['functional_channel'])
+        wfield_ins, explained_variance = cids_widefield(
+            dat, fs, scratch_folder/'cids.zarr',
+            functional = functional,
+            k = int(par['k']),
+            register = par['motion_correction'] != 'none',
+            decomposition = decomposition,
+            exclude_mask = par['exclude_mask'],
+            mask_threshold = par['mask_std_threshold'],
+            chunk_frames = int(par['chunk_size']),
+            device = 'auto')
+        SVT = wfield_ins.get('SVTcorr', wfield_ins['SVT'][:, functional::nchannels])
+        projections = [
+            ('var', svd_variance(wfield_ins['U'], SVT)),
+        ]
+        return wfield_ins, projections, explained_variance
 
     def open(self, key=None, use_corrected=True):
         from wfield import SVDStack
@@ -1334,6 +1412,7 @@ class CellSegmentationAtlas(dj.Computed):
     session columns; ``key_source`` constrains them to the widefield that the
     alignment's ImagingReference points at.
     '''
+    default_container = CONTAINER   # needs OpenCV (cv2.pointPolygonTest)
     definition = '''
     -> CellSegmentation
     -> TwoPhotonReferenceAlignment

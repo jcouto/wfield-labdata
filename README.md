@@ -4,7 +4,7 @@
 
 Look at the documentation for labdata [here](https://jcouto.github.io/labdata-docs)
 
-**Analysis pipeline:** `WfieldParameters`, `WfieldStack`
+**Analysis pipeline:** `WfieldParameters`, `WfieldStack` (with [`wfield`](https://github.com/jcouto/wfield) or `cids`)
 
 **Atlas registration:** `WidefieldAtlas`, `WidefieldAtlasTransform`
 
@@ -18,6 +18,8 @@ Look at the documentation for labdata [here](https://jcouto.github.io/labdata-do
 
 - `labdata` installed and configured (`database`, `storage`, `scratch_path`, `local_paths` in `user_preferences.json`)
 - `wfield` package installed (`pip install wfield` or from source)
+- `cids` installed (`pip install git+https://github.com/jcouto/cids.git`) to run `WfieldStack` with `backend='cids'`
+- or run everything in the container (`containers/labdata-wfield.sdef`, see [Running in a container](#running-in-a-container)), which has both
 - Widefield data already ingested into the `Widefield` table
 
 ---
@@ -73,6 +75,12 @@ WfieldParameters.insert1(dict(
 ```
 
 `wfield_analysis_id` lets you store multiple parameter sets for the same dataset — increment it for each run.
+
+To run the analysis with `cids` instead of `wfield`, set `backend` (see [wfield or cids](#wfield-or-cids)):
+
+```python
+WfieldParameters.insert1(dict(**key, wfield_analysis_id=2, backend='cids'))
+```
 
 ### Step 3 — Run the analysis
 
@@ -134,6 +142,7 @@ WfieldStack.Projection.insert1(dict(**key, wfield_analysis_id=0,
 | Field | Default | Description |
 |---|---|---|
 | `wfield_analysis_id` | — | Integer key; increment to store multiple runs per dataset |
+| `backend` | `'wfield'` | Library that runs the analysis: `'wfield'` or `'cids'` |
 | `motion_correction` | `'ecc'` | Algorithm: `'2d'`, `'ecc'`, `'normcorr'`, `'none'` |
 | `motion_conv_kernel` | `NULL` | Optional convolution kernel applied before motion correction |
 | `decomposition` | `'approx'` | SVD algorithm: `'approx'` (fast) or `'pmd'` |
@@ -145,6 +154,108 @@ WfieldStack.Projection.insert1(dict(**key, wfield_analysis_id=0,
 | `chunk_size` | `512` | Frames processed per chunk |
 | `mask_std_threshold` | `NULL` | If set, auto-generates a brain mask by thresholding pixel std |
 | `match_to_session` | `NULL` | Optional link to a `Session` entry for behavioural alignment |
+
+---
+
+## wfield or cids
+
+`WfieldParameters.backend` chooses the library `WfieldStack.populate()` uses:
+
+- `'wfield'` (default): motion correction, approximate SVD and hemodynamic correction with [`wfield`](https://github.com/jcouto/wfield) (Couto et al. 2021), as described above.
+- `'cids'`: [`cids`](https://github.com/jcouto/cids) `cids.widefield.run_widefield` — rigid registration with rotation on the functional channel (applied to every channel), baseline drift of each channel divided out, dF/F, compression (an SVD of every frame, or local low-rank denoising re-compressed over the frame), the band hemodynamic correction (below), and a check of how much of the raw dF/F the compression explains. It runs with `device='auto'`: an NVIDIA card (with cupy), else the GPU of an Apple silicon Mac (with MLX), else the CPU.
+
+Both write the same arrays to the `.npz`, so `open()`, `load()`, the projections and the dashboard work the same for both:
+
+| Array | wfield | cids |
+|---|---|---|
+| `U` | `(H, W, k)` | `(H, W, k)` |
+| `SVT` | `(k, frames × channels)`, channels interleaved | the same (`SVT[:, c::nchannels]` is channel `c`) |
+| `SVTcorr` | hemodynamic-corrected, `(k, frames)` | the same |
+| `motion` | `(3, channels, frames)`: x, y, rotation | the same (shift of the frame centre, rotation in degrees); every channel has the same motion |
+| `mean_proj` | mean of the motion-corrected frames | the baseline F0 of each channel |
+
+The cids results also hold the rest of what cids saved (`shifts`, `baseline`, `mask`, `channel_gain`, `hemo_coefficients`, `hemo_T` for the SVD, `singular_values`, `qc_compression_r2`, ...; sparse arrays are left out), and its settings and timings as JSON in `cids_attrs` (`json.loads(str(res['cids_attrs']))`). `wfield`'s `T` and `rcoeffs` are only in the wfield results. For cids, `WfieldStack.explained_variance` is the median over the mask of the R² of the raw dF/F by the SVD or the local denoising (before re-compression).
+
+How cids uses the `WfieldParameters` fields:
+
+| Field | With `backend='cids'` |
+|---|---|
+| `k` | number of SVD components |
+| `functional_channel` | the functional channel; with 2 or more channels, the next one is the isosbestic |
+| `motion_correction` | `'none'`: no registration; any other value: cids' rigid registration with rotation |
+| `exclude_mask` | pixels set to 1 are left out of the SVD |
+| `mask_std_threshold` | threshold of cids' activity mask (`cids.widefield.activity_mask`); NULL: no activity mask |
+| `chunk_size` | frames read at a time |
+| `decomposition` | `'approx'`: SVD with `k` components. `'pmd'`: local low-rank denoising (patches with as many components as their signal needs), then re-compressed over the frame (`cids.widefield.recompress`) into one dense `U`, the channels and the corrected components together, keeping all but 0.1% of each pixel's energy (`k` is not used) |
+| `motion_conv_kernel`, `nframes_decimate` | not used |
+
+Hemodynamic correction:
+
+- wfield: one regression coefficient per pixel, both channels filtered 0.1 Hz to `frame_rate/2 - 2`.
+- cids: the band correction — a coefficient per pixel in each of four frequency bands split at 1, 4 and 8 Hz (an edge is kept only if 1.3× the edge is below Nyquist, so at 30 Hz all three are used), after delaying the isosbestic channel to line up with the functional one (`channel_delay`, saved as `hemo_delay` in `cids_attrs`); both channels high-passed at 0.1 Hz, the isosbestic low-passed at 14 Hz. The coefficients are in `hemo_coefficients` (bands, H, W).
+
+**Updating an existing database:** `backend` is a new column. Add it once (rows that exist get `'wfield'`):
+
+```python
+WfieldParameters.alter()
+```
+
+Until then the plugin runs everything with wfield, and the dashboard only offers `backend='wfield'`.
+
+---
+
+## Running in a container
+
+`containers/labdata-wfield.sdef` builds an Apptainer image with labdata, wfield, cids, and cupy with the CUDA 12 libraries (for cids on an NVIDIA card). `WfieldStack`, `CellSegmentationAtlas` and `CidsCompute` name it as their container (`labdata-wfield`), so `labdata run` picks it.
+
+```bash
+labdata build-container containers/labdata-wfield.sdef --upload
+```
+
+The plugin is not in the image; send it with `--plugins`:
+
+```bash
+labdata run populate -t <remote> --plugins pwfield -- pwfield.WfieldStack -i labdata -p 1 \
+    -r "pwfield.WfieldParameters & dict(subject_name='subject001')"
+```
+
+Use one process (`-p 1`): cids and numba already use every core of the job.
+
+cids chooses its device itself (`device='auto'`): the card when the container sees one, the CPU otherwise. `WfieldStack` asks for a GPU (`cuda = True`), so its populate jobs run the container with the card (labdata reads `cuda` and `name` from the table since commit 9ee8d12). With `backend='wfield'` the card is not used. The jobs use the options of the remote for the `cids` analysis (`name = 'cids'`), the same as `CidsCompute`; give the remote a `cids` entry with a GPU queue, e.g. in its `analysis_options`:
+
+```json
+"cids": {"queue": "gpu-cost"}
+```
+
+Without it they use the default queue of the remote. The CUDA 12.6 libraries in the image need an NVIDIA driver of version 525 or later.
+
+## Cell segmentation with cids
+
+`CidsCompute` segments two-photon and miniscope datasets with cids, the same way `Suite2pCompute` and `CaimanCompute` of labdata do, and stores the results in `CellSegmentation` (algorithm `cids`), so `CellSegmentationAtlas` and the dashboards read them as they read the others. It lives in this plugin for now. Add it to the analyses of the preference file:
+
+```json
+"compute": {"analysis": {"cids": "labdata.pwfield.CidsCompute"}}
+```
+
+and run it with the plugin sent to the remote:
+
+```bash
+labdata run cids -a <SUBJECT> -s <SESSION> -t <REMOTE> --plugins pwfield -- --diameter 12
+labdata run cids -a <SUBJECT> -s <SESSION> -t <REMOTE> --plugins pwfield -- --help   # the options
+```
+
+Each plane runs through `cids.run_cells` (registration, denoising, detection and demixing, extraction, deconvolution and quality) on the GPU when the job has one (`cuda = True`, the remote's `cids` options). Miniscope recordings use the one-photon defaults of cids and two-photon recordings the two-photon ones. `--multisession` segments several sessions together, as with caiman.
+
+| Option | |
+|---|---|
+| `--diameter` | Cell diameter in pixels; `-1` (default) measures it on the movie. Every size of cids follows from it and the frame rate |
+| `--tau` | Decay time of the indicator in seconds; by default fitted to the accepted cells |
+| `--channel`, `--reference-channel` | Functional channel, and the channel to register on |
+| `--registration-patch`, `--min-pnr`, `--min-corr` | The most used values of `cids.cell_parameters` |
+| `--set NAME=VALUE ...` | Any other value of `cids.cell_parameters` (read as JSON), e.g. `--set max_shift=20 bidi=false` |
+| `--roi r0 c0 r1 c1` | Crop the frames, as for suite2p and caiman |
+
+What goes where: every cids component is a `ROI` (its footprint), and `Selection` says which passed cids' quality checks. `RawTraces.f_trace` is the demixed trace `C` (as caiman's `C`), `Traces.dff` the dF/F of cids, and `Deconvolved.deconv` its spikes. `MotionCorrection` stores cids' shifts with the sign flipped (the shift applied to register, as for suite2p). `Projection` holds the mean, std, max and lcorr of the first 2000 registered frames of each session, plus cids' `pnr` and `energy` images. The rest of cids' results stay on the scratch disk only with `--keep-files` (`cids view` opens them).
 
 ---
 

@@ -431,3 +431,161 @@ def register_similarity(src, dst, src_mask=None, dst_mask=None, init=None,
     info = dict(ncc=ncc, scale=s, rotation=a, translation=(tx, ty),
                 candidates=[dict(ncc=r[0], params=decompose_similarity(r[1])) for r in results])
     return M, info
+
+
+def svd_variance(U, SVT, block=65536):
+    '''Pixelwise variance over time of ``U @ SVT``, from the (k, k) covariance
+    of SVT, without rebuilding the frames.
+
+    Parameters
+    ----------
+    U : (height, width, k) array
+    SVT : (k, frames) array
+
+    Returns
+    -------
+    var : (height, width) float32 (np.var over frames, ddof=0)
+    '''
+    S = np.asarray(SVT, dtype=np.float64)
+    S = S - S.mean(axis=1, keepdims=True)
+    cov = (S @ S.T / S.shape[1]).astype(np.float32)
+    del S
+    flat = np.asarray(U, dtype=np.float32).reshape(-1, cov.shape[0])
+    var = np.empty(flat.shape[0], dtype=np.float32)
+    for a in range(0, flat.shape[0], block):
+        u = flat[a:a + block]
+        var[a:a + block] = np.einsum('ij,ij->i', u @ cov, u)
+    return var.reshape(np.shape(U)[:-1])
+
+
+HEMO_BANDS = (1.0, 4.0, 8.0)   # Hz, edges of the bands of cids' hemodynamic correction
+
+
+def cids_widefield(movie, frame_rate, output, functional=0, k=200, register=True,
+                   decomposition='svd', recompress_tolerance=1e-3,
+                   exclude_mask=None, mask_threshold=None,
+                   highpass=0.1, lowpass=14.0, hemo_bands=HEMO_BANDS, hemo_delay='auto',
+                   chunk_frames=512, device='auto', verbose=True):
+    '''Run ``cids.widefield.run_widefield`` and return its results in the
+    layout WfieldStack stores for wfield.
+
+    Parameters
+    ----------
+    movie : (frames, channels, height, width) array-like (e.g. a zarr array)
+    frame_rate : frames per second of each channel
+    output : path of the cids results group (a .zarr folder, e.g. in scratch)
+    functional : channel of the indicator; with more than one channel, the
+        next one ((functional + 1) % channels) is the isosbestic one used for
+        the hemodynamic correction
+    k : number of SVD components (decomposition 'svd')
+    register : rigid registration with rotation (False: the frames are used
+        as they are)
+    decomposition : 'svd' (k global components) or 'local' (cids' local
+        low-rank denoising, as PMD). The local components are then
+        re-compressed (``cids.widefield.recompress``) over the whole frame,
+        the channels and the corrected components together, keeping all but
+        ``recompress_tolerance`` of each pixel's energy, so that SVT and
+        SVTcorr share one dense U.
+    exclude_mask : (height, width) array, pixels != 0 are left out, or None
+    mask_threshold : threshold of cids' ``activity_mask`` (None: no activity
+        mask). With ``exclude_mask`` too, the activity mask is computed on the
+        frames before registration and combined with it.
+    highpass, lowpass, hemo_bands, hemo_delay : cids' hemodynamic correction:
+        a regression per pixel in each frequency band (split at ``hemo_bands``
+        Hz; edges too close to Nyquist are dropped), after delaying the
+        isosbestic channel (``'auto'``: ``channel_delay``); both channels
+        high-passed at ``highpass`` Hz, the isosbestic low-passed at
+        ``lowpass`` Hz
+    chunk_frames : frames read at a time
+    device : 'auto' (an NVIDIA card with cupy, else an Apple GPU with MLX, else
+        the CPU), 'cpu', 'cuda', 'cuda:N' or 'metal'
+
+    Returns
+    -------
+    res : dict of arrays for the .npz
+        U (height, width, k); SVT (k, frames * channels), channels
+        interleaved as in wfield (``SVT[:, c::channels]`` is channel c);
+        SVTcorr (k, frames), with more than one channel; motion (3, channels,
+        frames): x and y shift of the frame centre and rotation (degrees,
+        ``cids.registration.field_rotation``), the same for every channel;
+        mean_proj (channels, height, width) uint16, the baseline F0. Then
+        every other array cids saved (shifts, baseline, mask, channel_gain,
+        hemo_coefficients, singular_values, qc_*, ...; sparse ones are left
+        out) and its attributes as JSON in ``cids_attrs``.
+    explained_variance : median over the mask of the R2 of the raw dF/F of
+        the functional channel by the SVD or the local denoising (cids'
+        ``qc_compression_r2``), or None
+    '''
+    import json
+    from cids import io as cids_io
+    from cids.widefield import run_widefield, activity_mask
+    if decomposition not in ('svd', 'local'):
+        raise ValueError(f"decomposition is 'svd' or 'local', not {decomposition!r}")
+    nchannels, height, width = (int(n) for n in movie.shape[1:])
+    isosbestic = (functional + 1) % nchannels if nchannels > 1 else None
+    if exclude_mask is None and mask_threshold is None:
+        mask = None                    # every pixel, as wfield without a mask
+    elif exclude_mask is None:
+        mask = 'auto'
+    else:
+        mask = np.asarray(exclude_mask) == 0
+        if mask_threshold is not None:
+            mask = mask & activity_mask(movie, float(mask_threshold), functional)[0]
+    if hemo_bands is not None:         # each band edge needs its crossing (to 1.3 x the edge) below Nyquist
+        hemo_bands = tuple(float(e) for e in hemo_bands if 1.3 * e < frame_rate / 2)
+    out = run_widefield(movie, float(frame_rate), output=str(output), functional=functional,
+                        isosbestic=isosbestic, k=int(k), register=register,
+                        highpass=highpass, lowpass=lowpass, hemo_bands=hemo_bands or None,
+                        hemo_delay=hemo_delay, mask=mask,
+                        mask_threshold=5.0 if mask_threshold is None else float(mask_threshold),
+                        decomposition=decomposition, chunk_frames=int(chunk_frames), device=device,
+                        verbose=verbose)
+    group = cids_io.open_results(out, mode='r')
+    attrs = dict(group.attrs)
+    arrays = {name: np.asarray(group[name][...]) for name in group.array_keys()}
+    svt = arrays.pop('svt')                                      # (channels, K, frames)
+    corrected = arrays.pop('svt_corrected', None)                # (K, frames)
+    C, _, T = svt.shape
+    if decomposition == 'local':
+        # U is sparse (pixels, K), K in the thousands: re-compress the channels and the
+        # corrected components together, onto one dense U
+        from cids.widefield import widefield_components, recompress
+        U_local, _ = widefield_components(out)
+        joint = svt if corrected is None else np.concatenate([svt, corrected[None]])
+        del svt
+        U, joint, values = recompress(U_local, joint, recompress_tolerance,
+                                      mask=arrays.get('mask'), shape=(height, width))
+        del U_local
+        svt, corrected = joint[:C], (None if corrected is None else joint[C])
+        arrays['singular_values'] = values
+        attrs['recompress_tolerance'] = float(recompress_tolerance)
+        if verbose:
+            print(f'recompression: {len(values)} components over the frame')
+    else:
+        U = arrays.pop('U')
+    nk = U.shape[-1]
+    res = dict(U=np.asarray(U, dtype=np.float32),
+               SVT=np.ascontiguousarray(svt.transpose(1, 2, 0).reshape(nk, T * C)))
+    del svt
+    if corrected is not None:
+        res['SVTcorr'] = np.asarray(corrected, dtype=np.float32)
+    if 'shifts' in arrays:                                       # (frames, ny, nx, 2): (dy, dx)
+        from cids.registration import field_rotation
+        shifts = arrays['shifts']
+        dy, dx = shifts.reshape(T, -1, 2).mean(axis=1).T         # the shift of the frame centre
+        angle = field_rotation(shifts, arrays['centers_y'], arrays['centers_x'])
+    else:
+        dy = dx = angle = np.zeros(T)
+    motion = np.stack([dx, dy, angle]).astype('float32')          # (3, frames)
+    res['motion'] = np.ascontiguousarray(np.repeat(motion[:, None, :], C, axis=1))
+    res['mean_proj'] = np.clip(arrays['baseline'], 0, np.iinfo(np.uint16).max).astype('uint16')
+    res.update({name: value for name, value in arrays.items() if name not in res})
+    res['cids_attrs'] = np.array(json.dumps(attrs, default=str))
+    explained_variance = None
+    r2 = arrays.get('qc_compression_r2')
+    if r2 is not None:
+        inside = arrays.get('mask')
+        if inside is None or inside.shape != r2.shape:
+            inside = np.ones(r2.shape, dtype=bool)
+        explained_variance = float(np.nanmedian(r2[inside.astype(bool)]))
+    return res, explained_variance
