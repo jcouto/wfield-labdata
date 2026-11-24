@@ -1,0 +1,44 @@
+BootStrap: docker
+From: condaforge/miniforge3
+
+%post
+    apt-get -qq update
+    DEBIAN_FRONTEND=noninteractive apt-get -y install git rclone ca-certificates curl unzip wget awscli libglib2.0-0
+
+    # python environment (conda-forge), with cupy and the CUDA 12 libraries it needs, so cids
+    # runs on an NVIDIA card when the container is given one (apptainer --nv).
+    # CONDA_OVERRIDE_CUDA: the computer that builds the image does not need a card.
+    CONDA_OVERRIDE_CUDA=12.6 conda install -y python=3.11 numpy scipy numba pandas natsort \
+        scikit-image scikit-learn matplotlib cupy cuda-version=12.6
+    # zarr 2 and the codecs labdata writes the widefield stacks with
+    pip install "zarr>=2.18,<3" numcodecs imagecodecs
+    pip install git+https://github.com/jcouto/labdata.git@main
+    # the scanbox (.sbx) stacks that CidsCompute reads when a recording has no zarr
+    pip install sbxreader
+    # wfield (backend='wfield')
+    pip install git+https://github.com/jcouto/wfield.git@master
+    # cids (backend='cids'); not its [gpu] extra: cupy is already installed from conda-forge
+    pip install "cids[tiff] @ git+https://github.com/jcouto/cids.git@main"
+
+    pip cache purge
+    conda clean -a -y
+    apt-get autoremove -y
+    apt-get clean
+
+%test
+    python -c "import importlib.util; assert importlib.util.find_spec('cupy'), 'cupy is missing'"
+    python -c "from wfield import motion_correct, approximate_svd, hemodynamic_correction, SVDStack; from cids.widefield import run_widefield, recompress; from cids.device import resolve; import cids; print('wfield and cids', cids.VERSION, '- device auto here:', resolve('auto'))"
+
+%environment
+    export LABDATA_CONTAINER=1
+    export LC_ALL=C
+    export MPLBACKEND=Agg
+    # numba already uses all cores of a job: populate with one process (-p 1)
+    export NUMBA_CACHE_DIR=/tmp/numba_cache
+
+%runscript
+    exec echo "$@"
+    # the plugin itself is not in the container: send it with `labdata run ... --plugins pwfield`
+%labels
+    Maintainer Joao Couto
+    Description labdata, wfield and cids (with cupy) for the labdata wfield plugin (WfieldStack with backend wfield or cids, CidsCompute)
