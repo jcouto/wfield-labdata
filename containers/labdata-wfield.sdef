@@ -3,7 +3,8 @@ From: condaforge/miniforge3
 
 %post
     apt-get -qq update
-    DEBIAN_FRONTEND=noninteractive apt-get -y install git rclone ca-certificates curl unzip wget awscli libglib2.0-0
+    # (the image is Ubuntu 24.04, which has no awscli package: it is installed with pip below)
+    DEBIAN_FRONTEND=noninteractive apt-get -y install git rclone ca-certificates curl unzip wget libglib2.0-0
 
     # python environment (conda-forge), with cupy and the CUDA 12 libraries it needs, so cids
     # runs on an NVIDIA card when the container is given one (apptainer --nv).
@@ -12,6 +13,8 @@ From: condaforge/miniforge3
         scikit-image scikit-learn matplotlib cupy cuda-version=12.6
     # zarr 2 and the codecs labdata writes the widefield stacks with
     pip install "zarr>=2.18,<3" numcodecs imagecodecs
+    # the aws command line, with boto3 so that pip picks a botocore both accept
+    pip install awscli boto3
     pip install git+https://github.com/jcouto/labdata.git@main
     # the scanbox (.sbx) stacks that CidsCompute reads when a recording has no zarr
     pip install sbxreader
@@ -26,6 +29,7 @@ From: condaforge/miniforge3
     apt-get clean
 
 %test
+    aws --version
     python -c "import importlib.util; assert importlib.util.find_spec('cupy'), 'cupy is missing'"
     python -c "from wfield import motion_correct, approximate_svd, hemodynamic_correction, SVDStack; from cids.widefield import run_widefield, recompress; from cids.device import resolve; import cids; print('wfield and cids', cids.VERSION, '- device auto here:', resolve('auto'))"
 
