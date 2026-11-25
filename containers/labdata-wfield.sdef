@@ -40,6 +40,9 @@ From: condaforge/miniforge3
     # cupy and cuda-pathfinder find the CUDA headers of conda (/opt/conda/targets/x86_64-linux/include),
     # which cupy compiles the kernels of cids with, through CONDA_PREFIX; apptainer does not activate conda
     export CONDA_PREFIX=/opt/conda
+    # cupy makes its kernel cache when imported (~/.cupy by default, read-only in the build test)
+    export CUPY_CACHE_DIR=/tmp/cupy_kernel_cache_$(id -u)
+    export MPLCONFIGDIR=/tmp/matplotlib_$(id -u)
     export LC_ALL=C
     export MPLBACKEND=Agg
     # numba already uses all cores of a job: populate with one process (-p 1)
