@@ -31,10 +31,15 @@ From: condaforge/miniforge3
 %test
     aws --version
     python -c "import importlib.util; assert importlib.util.find_spec('cupy'), 'cupy is missing'"
+    # the headers cupy compiles kernels with (the lookup of cupy; it needs no card)
+    python -c "from cuda.pathfinder import find_nvidia_header_directory; d = find_nvidia_header_directory('cudart'); assert d, 'cupy will not find the CUDA headers'; print('CUDA headers:', d)"
     python -c "from wfield import motion_correct, approximate_svd, hemodynamic_correction, SVDStack; from cids.widefield import run_widefield, recompress; from cids.device import resolve; import cids; print('wfield and cids', cids.VERSION, '- device auto here:', resolve('auto'))"
 
 %environment
     export LABDATA_CONTAINER=1
+    # cupy and cuda-pathfinder find the CUDA headers of conda (/opt/conda/targets/x86_64-linux/include),
+    # which cupy compiles the kernels of cids with, through CONDA_PREFIX; apptainer does not activate conda
+    export CONDA_PREFIX=/opt/conda
     export LC_ALL=C
     export MPLBACKEND=Agg
     # numba already uses all cores of a job: populate with one process (-p 1)
